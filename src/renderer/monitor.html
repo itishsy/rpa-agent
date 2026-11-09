@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RPA任务监控</title>
+  <link rel="stylesheet" href="monitor.css">
+<link rel="stylesheet" href="appearance.css"><script src="theme.js"></script><link rel="stylesheet" href="apple.css"></head>
+<body>
+  <main class="page">
+    <section class="header">
+      <div>
+        <h1>RPA任务监控</h1>
+      </div>
+      <div class="actions">
+        <div id="filterSummary" class="filter-summary" aria-live="polite"></div>
+        <button id="filterButton" class="button" type="button" aria-expanded="false" aria-controls="filterForm">过滤器</button>
+        
+        <button id="exportButton" class="button" type="button" disabled>导出当前任务</button>
+        <button id="refreshButton" class="button primary">立即刷新</button><button id="analyzeButton" class="button" type="button">分析Agent</button><button id="stopAnalysis" class="button" type="button" hidden>停止分析</button>
+      </div>
+    </section>
+
+    <form id="filterForm" class="filter-settings">
+      <div class="filter-rule-header"><span>选择字段</span><span>条件</span><span>关键字</span><span></span></div>
+      <div id="filterRules"></div>
+      <button id="addFilterRuleButton" class="button" type="button">添加条件</button>
+      <span class="hint">关键字可用逗号分隔：包含匹配任一词，不包含排除任一词；多个条件按“且”组合</span>
+      <div class="filter-footer">
+        <label class="filter-checkbox" for="filterPayFee"><input id="filterPayFee" type="checkbox" checked>包含缴费任务</label>
+        <div class="filter-actions"><button id="clearFilterButton" class="button" type="button">清除过滤</button><button class="button primary" type="submit">应用过滤</button></div>
+      </div>
+    </form>
+
+    <form id="settingsForm" class="settings">
+      <div>
+        <h3 class="monitor-apps-title">监控应用</h3>
+        <input id="keywords" type="hidden"><div id="monitorAppsEditor"></div>
+      </div>
+      <div class="server-settings">
+        <h3 class="monitor-apps-title">配置数据源</h3>
+        <div class="server-header"><span>base_server</span><span>username</span><span>password</span><span></span></div>
+        <div id="serverRows"></div>
+        <div class="hint">密码留空表示保留原密码；新增或修改服务地址时需重新填写密码。缴费任务账户由系统设置中的“任务监控设置”统一管理。</div>
+      </div>
+      <div class="settings-footer">
+        <button id="addServerButton" class="button" type="button">添加服务</button>
+        <button class="button primary" type="submit">保存并刷新</button>
+      </div>
+    </form>
+
+    <section class="status-row">
+      <div class="stat"><div class="stat-label">数据条数</div><div id="rowCount" class="stat-value">—</div></div>
+      <div class="stat"><div class="stat-label">未完成合计</div><div id="totalIncomplete" class="stat-value">—</div></div>
+      <div class="stat"><div class="stat-label">刷新状态</div><div id="refreshStatus" class="stat-value" style="font-size:14px">等待首次刷新</div></div>
+    </section>
+
+    <div id="message" class="message"></div>
+    <section class="table-card">
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>应用</th>
+              <th>客户名称</th>
+              <th>申报账户</th>
+              <th>任务状态</th>
+              <th title="业务名称及待处理数量；审核中任务单独标注">未完成任务</th>
+              <th>未完成原因</th><th>备注</th>
+              <th class="execution-count" title="今日执行次数">执行次数</th>
+              <th class="monitor-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+        <div id="empty" class="empty">正在读取数据…</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="monitor-apps.js"></script><script src="monitor.js"></script><script src="takeover.js"></script>
+</body>
+</html>

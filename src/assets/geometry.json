@@ -1,0 +1,54 @@
+{
+  "phi": 1.618033988749895,
+  "canvas": 256,
+  "markHeight": 158.21670111997307,
+  "stroke": 14.266391040215346,
+  "leftStroke": 17.634229119300105,
+  "leftStrokeColor": "#90CFCB",
+  "leftShift": 23.0835055998654,
+  "projectionOffset": 28.532782080430696,
+  "projectionWeight": 10.898552961130589,
+  "projectionColor": "#56818A",
+  "projectionTop": 80.79226959952892,
+  "projectionEndX": 123.59144272017497,
+  "innerFoot": 84.55762704055184,
+  "outerFoot": 56.02484496012114,
+  "crownControlX": 116.45824720006729,
+  "crownControlY": 11.541752799932697,
+  "crownEntryX": 93.37474160020187,
+  "crownExitX": 139.5417527999327,
+  "crownJoinY": 86.24154608009424,
+  "crownTrim": 74.69979328016154,
+  "crownY": 48.89164944001347,
+  "inset": 48.89164944001347,
+  "tileRadius": 60.43340223994616,
+  "apexX": 128,
+  "crossbarY": 146.67494832004036,
+  "leftFootX": 79.10835055998655,
+  "rightFootX": 176.89164944001345,
+  "legSpan": 97.7832988800269,
+  "headDiameter": 97.7832988800269,
+  "headRadius": 48.89164944001345,
+  "headCenter": {
+    "x": 128,
+    "y": 97.78329888002692
+  },
+  "arcStart": {
+    "x": 152.44582472000673,
+    "y": 55.441888432052046
+  },
+  "arcEnd": {
+    "x": 103.55417527999329,
+    "y": 140.1247093280018
+  },
+  "arcSweepDegrees": 180,
+  "icoSizes": [
+    16,
+    24,
+    32,
+    48,
+    64,
+    128,
+    256
+  ]
+}

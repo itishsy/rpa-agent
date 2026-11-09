@@ -1,0 +1,38 @@
+{
+  "name": "rpa-agent",
+  "version": "1.0.4",
+  "private": true,
+  "description": "Framework-free Electron RPA development and agent workstation",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/*.test.js",
+    "check": "node tools/check.js",
+    "test:electron": "electron tests/electron-smoke.js",
+    "test:business": "electron tests/electron-business.js",
+    "test:shell": "electron tests/electron-shell.js",
+    "test:design": "electron tests/electron-design.js",
+    "test:auth": "electron tests/electron-auth.js",
+    "test:analysis": "electron tests/electron-task-analysis.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "electron": "37.6.1",
+    "electron-builder": "26.0.12",
+    "resedit": "1.7.2"
+  },
+  "build": {
+    "appId": "com.seebon.rpa.agent",
+    "productName": "rpa-agent",
+    "files": ["src/**/*", "package.json"],
+    "directories": { "output": "release" },
+    "afterPack": "tools/after-pack.js",
+    "win": { "target": "nsis", "icon":"src/assets/app.ico", "signAndEditExecutable": false },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "installerIcon":"src/assets/app.ico", "uninstallerIcon":"src/assets/app.ico" }
+  }
+}

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="RPA Agent RA monogram">
+<title>RPA Agent · RA</title><desc>Minimal RA thinking-person monogram: softened A crown, slightly heavier muted teal left stroke, and a smooth circular R bowl. Golden-ratio construction: canvas/construction height = phi; construction height/leg span = phi; construction height/stroke = phi^5; head diameter = construction height/phi; crown trim = stroke*phi. Phi=1.618033988749895.</desc>
+<rect width="256" height="256" rx="60.433" fill="#152A3B"/>
+<defs><clipPath id="headInterior"><circle cx="128" cy="97.783" r="48.892"/><rect width="128" height="256"/><rect width="256" height="97.783"/></clipPath></defs>
+<g fill="none" stroke="#F8F7F3" stroke-width="14.266" stroke-linecap="round" stroke-linejoin="round">
+<path d="M84.558 207.108L123.591 80.792" stroke="#56818A" stroke-width="10.899"/>
+<path d="M56.025 207.108L93.375 86.242Q116.458 11.542 139.542 86.242L176.892 207.108"/>
+<path d="M56.025 207.108L93.375 86.242Q116.458 11.542 139.542 86.242L176.892 207.108" stroke="#90CFCB" stroke-width="17.634" clip-path="url(#headInterior)"/>
+<path d="M152.446 55.442A48.892 48.892 0 0 1 103.554 140.125"/>
+</g></svg>
