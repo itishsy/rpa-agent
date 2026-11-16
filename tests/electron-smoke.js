@@ -13,7 +13,8 @@ fs.mkdirSync(artifactDirectory, { recursive: true })
 process.env.RPA_AGENT_TEST_DATA = fs.mkdtempSync(path.join(artifactDirectory, 'smoke-data-'))
 const errors = []
 const commands = [{ actionCode: 'page', actionName: '页面', groupName: '浏览器' }, { actionCode: 'subFlow', actionName: '调用子流程', groupName: '流程' },
-  { actionCode: 'h5Login', actionName: 'H5登录', groupName: 'declare' }]
+  { actionCode: 'h5Login', actionName: 'H5登录', groupName: 'declare' },{actionCode:'codeBlock',actionName:'代码块',actionArgsVOS:[],targetArgsVOS:[]},
+  {actionCode:'start',actionName:'旧图开始'},{actionCode:'end',actionName:'旧图结束'}]
 const h5Fields = require('../src/services/action-knowledge.json').actions.find(action => action.actionCode === 'h5Login').actionFields.map(field => ({
   fieldKey: field.key, fieldName: field.name, required: field.required ? 1 : 0, fieldType: 'text',
   cond: field.conditions.length ? JSON.stringify(Object.fromEntries(field.conditions.map(condition => {
@@ -25,17 +26,18 @@ let rows = [{ stepCode: 's1', stepName: '打开页面', actionCode: 'page', leve
   actionArgs: '{"actionType":"access","actionArgs":"https://example.test"}', targetArgs: '{}' }]
 let childRows = [{ stepCode: 'child-step', stepName: '子页面', actionCode: 'page', level: 0, number: 0,
   actionArgs: '{"actionType":"access","actionArgs":"https://example.test/child"}', targetArgs: '{}' }]
-const publicTemplates = [{ flowCode: 'template-child', flowName: '医疗增员单个' },
+let invalidLeafJump=false
+let emptyBlockTest=false,emptyBlockRows=[{stepCode:'login-block',stepName:'账号密码登录',actionCode:'codeBlock',level:0,number:0,list:[]}]
+const publicTemplates = [{ flowCode: 'template-child', flowName: '医疗增员单个',readOnly:true },
   { flowCode: 'template-leaf', flowName: '模板末级' }, { flowCode: 'template-body', flowName: '来源模板' }]
 let requests = [], cancelled = false, modelCalls = 0, lastDebugDsl, steeredResponse
+let holdDebug = false, releaseDebug
 let budgetSamples = 0, closingSamples = 0
-let officialBusinessState = '已入账'
-let changedTemplateLeaf = false
 let duplicateIdentityTest = false
 const server = http.createServer((req, res) => {
   requests.push({ method: req.method, path: req.url })
   let body = ''; req.on('data', chunk => { body += chunk })
-  req.on('end', () => {
+  req.on('end', async () => {
     const url = new URL(req.url, 'http://local')
     let data
     if (url.pathname === '/v1/chat/completions') {
@@ -55,7 +57,7 @@ const server = http.createServer((req, res) => {
       }
       if(lastUser==='[execute-without-confirmation]'){
         const done=JSON.parse(body).messages.some(message=>message.role==='tool'&&message.tool_call_id==='auto-execution')
-        const message=done?{role:'assistant',content:'执行完成'}:{role:'assistant',content:'',tool_calls:[{id:'auto-execution',type:'function',function:{name:'run_current_dsl',arguments:'{}'}}]}
+        const message=done?{role:'assistant',content:'执行完成'}:{role:'assistant',content:'正在读取现场。',tool_calls:[{id:'auto-execution',type:'function',function:{name:'run_current_dsl',arguments:'{}'}}]}
         res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{message}]}));return
       }
       if (lastUser === '[truncated-integration]') {
@@ -77,26 +79,29 @@ const server = http.createServer((req, res) => {
     else if (url.pathname.endsWith('/oauth/check_token')) data = { active: true, exp: Date.now() / 1000 + 3600 }
     else if (url.pathname.endsWith('/sys/user/menu/listMenuByUser/1')) data = { menus:[],tabs:[],buttons:[] }
     else if (url.pathname.endsWith('/robot/app/getAppData') || url.pathname.endsWith('/robot/app/page')) data = { rows: [{ appCode: 'app', appName: '离线示例', appArgs: '{}' }], total: 1 }
-    else if (url.pathname.endsWith('/robot/flow/list')) data = [{ flowCode: 'flow', flowName: '示例流程', appCode: 'app' }, { flowCode: 'child', flowName: '子流程', appCode: 'app' },
-      { flowCode: 'template-alias', flowName: '引用模板', appCode: 'app', templateFlowCode: 'template-body' },
+    else if (url.pathname.endsWith('/robot/flow/list')) data = [{ flowCode: 'flow', flowName: '示例流程', appCode: 'app' }, { flowCode: 'child', flowName: '子流程', appCode: 'app',templateFlowCode:'unused-template' },
+      { flowCode: 'template-alias', flowName: '引用模板', appCode: 'app', templateFlowCode: 'template-body' },...publicTemplates.map(flow=>({...flow,appCode:'app'})),
+      ...(emptyBlockTest?[{flowCode:'empty-block',flowName:'登录',appCode:'app',templateFlowCode:'stale-template'}]:[]),
       ...(duplicateIdentityTest ? [{ flowCode: 'duplicate-flow', flowName: '重复编码场景', appCode: 'app' }] : [])]
     else if (url.pathname.endsWith('/robot/flow/listTemplate')) {
       assert.equal(url.searchParams.get('flowType'), '2'); assert.equal(url.searchParams.get('templateType'), '1'); data = publicTemplates
     }
     else if (url.pathname.endsWith('/robot/client/app/getByFlowCode/template-body')) data = publicTemplates.find(flow => flow.flowCode === 'template-body')
     else if (url.pathname.endsWith('/robot/flow/step/list/template-alias')) {
-      assert.equal(url.searchParams.get('templateFlowCode'), 'template-body')
       data = [{ stepCode: 'alias-call', stepName: '调用模板单个', actionCode: 'subFlow', level: 0, actionArgs: '{"flowName":"医疗增员单个"}' }]
     }
+    else if (url.pathname.endsWith('/robot/flow/step/list/template-body')) data=[{stepCode:'alias-call',stepName:'调用模板单个',actionCode:'subFlow',level:0,actionArgs:'{"flowName":"医疗增员单个"}'}]
     else if (url.pathname.endsWith('/robot/flow/step/list/template-child')) data = [{ stepCode: 'template-page', stepName: '模板页面', actionCode: 'page', level: 0,
       actionArgs: '{"actionType":"access","actionArgs":"https://example.test/template"}', list: [
         { stepCode: 'template-nested', stepName: '模板中的嵌套调用', actionCode: 'subFlow', level: 1, actionArgs: '{"flowName":"模板末级"}' }
       ] }]
     else if (url.pathname.endsWith('/robot/flow/step/list/template-leaf')) data = [{ stepCode: 'template-leaf-step', stepName: '模板末级页面', actionCode: 'page', level: 0,
-      actionArgs: JSON.stringify({ actionType: 'access', actionArgs: 'https://example.test/leaf' + (changedTemplateLeaf ? '?changed=1' : '') }) }]
+      ...(invalidLeafJump?{skipTo:'退出浏览器'}:{}),
+      actionArgs: JSON.stringify({ actionType: 'access', actionArgs: 'https://example.test/leaf' }) }]
     else if (url.pathname.endsWith('/robot/flow/step/list/flow') || url.pathname.endsWith('/robot/flow/step/list/duplicate-flow')) data = rows
     else if (url.pathname.endsWith('/robot/flow/step/list/child')) data = childRows
-    else if (url.pathname.endsWith('/robot/flow/step/save')) { if (url.searchParams.get('flowCode') === 'child') childRows = JSON.parse(body); else rows = JSON.parse(body); data = true }
+    else if (url.pathname.endsWith('/robot/flow/step/list/empty-block')) {assert.equal(url.searchParams.has('templateFlowCode'),false);data=emptyBlockRows}
+    else if (url.pathname.endsWith('/robot/flow/step/save')) { if (url.searchParams.get('flowCode') === 'child') childRows = JSON.parse(body); else if(url.searchParams.get('flowCode')==='empty-block')emptyBlockRows=JSON.parse(body);else rows = JSON.parse(body); data = true }
     else if (url.pathname.endsWith('/robot/action/all')) data = commands
     else if (url.pathname.endsWith('/robot/action/args')) data = url.searchParams.get('dataCode') === 'h5Login' ? h5Fields
       : url.searchParams.get('dataCode') === 'subFlow' ? [{ fieldKey: 'flowName', fieldName: '流程', fieldType: 'text' }] : fields
@@ -107,13 +112,23 @@ const server = http.createServer((req, res) => {
     else if (url.pathname.endsWith('/api/robot/debug/runs')) {
       assert.equal(req.headers['x-rpa-debug-token'], 'smoke-debug')
       lastDebugDsl = JSON.parse(body).dsl
-      data = { status: 'SUCCEEDED', executionCode: 'run-1', snapshots: [{ phase: 'FINAL', snapshotId: 'final-1', dom: { status: 'AVAILABLE', content: `<html><body>业务成功<span id="account">unit1</span><span id="period">2026-11</span><span id="count">2</span><span id="amount">100.00</span><span id="officialState">${officialBusinessState}</span><table><tr><td class="person">p1</td><td class="state">已入账</td></tr><tr><td class="person">p2</td><td class="state">${officialBusinessState}</td></tr></table></body></html>`, url: 'https://example.test' } }] }
+      data = { status: 'SUCCEEDED', executionCode: 'run-1', snapshots: [{ phase: 'FINAL', snapshotId: 'final-1', dom: { status: 'AVAILABLE', content: `<html><body>业务成功<span id="account">unit1</span><span id="period">2026-11</span><span id="count">2</span><span id="amount">100.00</span><span id="officialState">已入账</span><table><tr><td class="person">p1</td><td class="state">已入账</td></tr><tr><td class="person">p2</td><td class="state">已入账</td></tr></table></body></html>`, url: 'https://example.test' } }] }
+      data.trace = [{ stepName: '判断页面', status: 'BRANCH', message: '条件成立' },
+        { stepName: '被跳过的页面', status: 'SKIPPED' }, { stepName: '访问页面', status: 'SUCCEEDED' }]
+      data.startedAt = '2026-11-12T01:02:03.000Z'
+      data.snapshots[0].ctx = { variables: [{ name: 'status', type: 'String', value: 'fixture-context' }] }
+      data.snapshots[0].screenshots = { items: [{ contentType: 'image/png', base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jcZkAAAAASUVORK5CYII=' }] }
+      if (holdDebug) {
+        holdDebug = false
+        await new Promise(resolve => { releaseDebug = resolve })
+      }
     } else if (url.pathname.endsWith('/api/robot/start/status')) data = 0
     else { res.writeHead(404); res.end(JSON.stringify({ message: 'unknown mock endpoint: ' + req.url })); return }
     res.setHeader('Content-Type', 'application/json')
     res.end(JSON.stringify({ code: 200, data }))
   })
 })
+const secondExecutor = http.createServer(server.listeners('request')[0])
 const deadline = setTimeout(() => { console.error('Electron smoke timed out'); app.exit(1) }, 45000)
 app.on('web-contents-created', (_event, contents) => {
   contents.on('console-message', (_event, details, message) => { if (details?.level === 'error' || details === 3) errors.push(details?.message || message) })
@@ -124,8 +139,11 @@ app.on('browser-window-created', (_event, win) => {
     if (!win.webContents.getURL().endsWith('/index.html')) return
     try {
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+      await new Promise(resolve => secondExecutor.listen(0, '127.0.0.1', resolve))
       const endpoint = `http://127.0.0.1:${server.address().port}`
+      const secondEndpoint = `http://127.0.0.1:${secondExecutor.address().port}`
       const run = script => win.webContents.executeJavaScript(script, true)
+      const wait=async code=>{for(let i=0;i<300;i++){if(await run(code))return;await new Promise(resolve=>setTimeout(resolve,30))}throw new Error('Timed out '+code+'; '+await run('$("patchReviewDialog")?.textContent||$("notice").textContent'))}
       assert.equal(await run('typeof window.require'), 'undefined')
       assert.equal(await run('typeof window.desktop.invoke'), 'function')
       assert.equal(safeStorage.isEncryptionAvailable(), true)
@@ -133,40 +151,82 @@ app.on('browser-window-created', (_event, win) => {
         await desktop.invoke('auth:login',{baseUrl:${JSON.stringify(endpoint+'/api')},username:'test',password:'offline-user'});
         const saved = await desktop.invoke('platforms:save', [{name:'Mock',url:${JSON.stringify(endpoint + '/api')},username:'test',password:'local-only-password'}]);
         await desktop.invoke('platform:select', saved.platforms[0].id);
-        await desktop.invoke('settings:save', {modelBaseUrl:${JSON.stringify(endpoint + '/v1')},modelName:'mock-model',modelApiKey:'mock-model-key',localDebugToken:'',remoteEnabled:true,connections:[{baseUrl:${JSON.stringify(endpoint)},debugToken:'smoke-debug'}]});
+        await desktop.invoke('settings:save', {modelBaseUrl:${JSON.stringify(endpoint + '/v1')},modelName:'mock-model',modelApiKey:'mock-model-key',localDebugToken:'',remoteEnabled:true,connections:[{baseUrl:${JSON.stringify(endpoint)},debugToken:'smoke-debug'},{baseUrl:${JSON.stringify(secondEndpoint)},debugToken:'smoke-debug'}]});
         await bootstrap(); await loadApplications(); document.getElementById('application').value='app'; await loadFlows(); document.getElementById('flow').value='flow'; await openFlow();
         current = await desktop.invoke('workspace:update', current.id, {taskCode:'task'});
-        current = await desktop.invoke('workspace:assertions', current.id, [{id:'success',type:'textContains',expected:'业务成功'}]);
         return true;
       })()`)
       assert.equal(await run('document.querySelectorAll(".step-item").length'), 1)
-      await run(`(async()=>{ document.getElementById('stepName').value='修改后的页面'; document.getElementById('commitStep').click(); })()`)
+      await run(`(async()=>{ document.getElementById('stepName').value='修改后的页面'; await commitSelectedStep(); })()`)
       await new Promise(resolve => setTimeout(resolve, 300))
       assert.equal(await run('current.dsl.steps[0].stepName'), '修改后的页面')
       await run('desktop.invoke("workspace:save", current.id)')
       assert.equal(rows[0].stepName, '修改后的页面')
+      const callsBeforeRun = modelCalls
+      const runsBeforeRun = requests.filter(item=>item.path==='/api/robot/debug/runs').length
+      await run('$("mode").value="develop";updateComposerMode();$("send").click()')
+      await wait('$("defaultAgentPrompt").open')
+      assert.match(await run('$("defaultAgentPromptText").textContent'),/候选修复补丁/)
+      await run('$("defaultAgentPrompt").querySelector("[value=cancel]").click()')
+      await wait('!$("defaultAgentPrompt").open&&!$("send").disabled')
+      await run('$("mode").value="dslRun";updateComposerMode();$("send").click()')
+      await wait('$("defaultAgentPrompt").open')
+      assert.match(await run('$("defaultAgentPromptText").textContent'),/采集.*不做诊断/)
+      assert.equal(requests.filter(item=>item.path==='/api/robot/debug/runs').length,runsBeforeRun)
+      await run('$("confirmDefaultAgentPrompt").click()')
+      await wait('$("executionEvidenceDialog")?.open&&!$("send").disabled')
+      assert.equal(await run('current.turn.mode'), 'dslRun')
+      assert.equal(await run('current.runs[0].verification.reason'), '仅运行模式未进行业务核验')
+      assert.equal(await run('!!current.proposal'), false)
+      assert.doesNotMatch(await run('$("executionEvidenceSummary").textContent'), /业务核验/)
+      assert.equal(modelCalls,callsBeforeRun)
+      assert.equal(requests.filter(item=>item.path==='/api/robot/debug/runs').length,runsBeforeRun+1)
+      await run('$("executionEvidenceDialog").close();$("mode").value="generate";updateComposerMode()')
       await run('direct("run_current_dsl")')
-      assert.equal(await run('current.runs[0].verification.status'), 'VERIFIED')
+      assert.equal(await run('current.runs[0].verification.status'), 'UNKNOWN')
+      assert.equal(await run('$("executionEvidenceDialog")?.open'), true)
+      assert.match(await run('$("executionEvidenceSummary").textContent'), /当前完整 DSL/)
+      assert.match(await run('$("executionEvidenceRun").textContent'), /run-1.*2026.*09:02:03/)
+      assert.match(await run('$("executionEvidenceSummary").textContent'), /调试成功.*业务核验：未确认/)
+      assert.match(await run('$("executionEvidencePanel").textContent'), /判断页面.*分支跳转.*访问页面.*成功/)
+      assert.doesNotMatch(await run('$("executionEvidencePanel").textContent'), /被跳过的页面/)
+      await run('$("evidence-tab-ctx").click()')
+      assert.match(await run('$("executionEvidencePanel").textContent'), /fixture-context/)
+      await run('$("evidence-tab-dom").click()')
+      assert.match(await run('$("executionEvidencePanel pre")?.textContent || $("executionEvidencePanel").textContent'), /<html>.*业务成功/)
+      await run('$("evidence-tab-screenshots").click()')
+      assert.match(await run('$("executionEvidencePanel").querySelector("img").src'), /^data:image\/png;base64,/)
+      await run('$("executionEvidenceDialog").close()')
       const beforeAuto=requests.filter(item=>item.path==='/api/robot/debug/runs').length
       await run('desktop.invoke("agent:start",current.id,{request:"[execute-without-confirmation]",mode:"develop"})')
       assert.equal(requests.filter(item=>item.path==='/api/robot/debug/runs').length,beforeAuto+1)
       assert.equal(await run('current.pendingApproval==null&&$("approval").hidden'),true)
-      assert.match(await run('$("timeline").textContent'),/调用工具：run_current_dsl，真实执行当前流程并采集现场。/)
-      assert.equal(await run('[...$("timeline").querySelectorAll(".event-line")].every(item=>!item.textContent.includes("\\n")&&getComputedStyle(item).whiteSpace==="nowrap"&&item.title===item.textContent)'),true)
+      await run('[...$("timeline").querySelectorAll("button[data-debug-artifact]")].at(-1).click()')
+      await wait('$("executionEvidenceDialog")?.open')
+      await run('$("executionEvidenceDialog").close()')
+      await wait('$("timeline").textContent.includes("执行完成")')
+      assert.doesNotMatch(await run('$("timeline").textContent'),/调用工具：|正在读取现场/)
+      assert.equal(await run('$("plan").childElementCount'),0)
+      await run('refreshSnapshot()')
+      await run('$("timeline").replaceChildren();restoreAgentTimeline(current)')
+      assert.match(await run('$("timeline").textContent'),/执行完成/)
+      assert.doesNotMatch(await run('$("timeline").textContent'),/调用工具：|正在读取现场/)
+      assert.ok(await run('$("timeline").querySelector("button[data-debug-artifact]")'))
       await run('desktop.invoke("agent:start", current.id, {request:"生成修复候选",mode:"generate"})')
-      assert.match(await run('document.getElementById("timeline").textContent'), /调用工具：get_flow_context，确认当前流程基线，为生成修复候选做准备/)
+      assert.match(await run('$("timeline").textContent'),/候选已生成/)
+      assert.doesNotMatch(await run('$("timeline").textContent'),/调用工具：get_flow_context/)
       await run('refreshSnapshot()')
       assert.equal(await run('current.proposal.dsl.steps[0].stepName'), '模型候选页面')
       assert.equal(await run('current.dsl.steps[0].stepName'), '修改后的页面')
       assert.equal(modelCalls, 3)
-      await run('(async()=>{ current = await desktop.invoke("workspace:candidate", current.id, "apply"); current = await desktop.invoke("workspace:save", current.id); renderWorkspace() })()')
+      await run('(async()=>{ current = await desktop.invoke("workspace:candidate", current.id, "apply", {reviewId:(await desktop.invoke("workspace:candidate",current.id,"review")).reviewId}); current = await desktop.invoke("workspace:save", current.id); renderWorkspace() })()')
       assert.equal(rows[0].stepName, '模型候选页面')
       const executionCount = requests.filter(item => item.path === '/api/robot/debug/runs').length
       const steeringTurn = run('desktop.invoke("agent:start",current.id,{request:"[steer-integration]",mode:"develop"})')
       for (let tries = 0; tries < 30 && !steeredResponse; tries++) await new Promise(resolve => setTimeout(resolve, 50))
       assert.ok(steeredResponse)
       await run('refreshSnapshot()')
-      await run('desktop.invoke("agent:steer",current.id,"仅分析当前步骤，不运行",current.turn.id)')
+      await run('desktop.invoke("agent:steer",current.id,"仅分析当前步骤，不运行",current.turn.id,[])')
       steeredResponse.setHeader('Content-Type', 'application/json')
       steeredResponse.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'obsolete-steer', type: 'function', function: { name: 'run_current_dsl', arguments: '{}' } }] } }] }))
       await steeringTurn; await run('refreshSnapshot()')
@@ -179,11 +239,11 @@ app.on('browser-window-created', (_event, win) => {
       assert.equal(requests.filter(item => item.path === '/api/robot/debug/runs').length, executionCount)
       const sessionId = await run('current.id')
       const beforeRestore = await run('current.savedBaseline')
-      await run(`openFlow(${JSON.stringify(sessionId)})`)
-      assert.equal(await run('current.runs.length'), 2)
+      await run(`(async()=>installWorkspace(await desktop.invoke('workspace:attach',${JSON.stringify(sessionId)})))()`)
+      assert.equal(await run('current.runs.length'), 3)
       if (await run('!!current.serverChanged')) console.error('Baseline before/after', JSON.stringify(beforeRestore), JSON.stringify(await run('current.savedBaseline')))
       assert.equal(await run('!!current.serverChanged'), false)
-      assert.equal(await run('current.runs[0].verification.status'), 'VERIFIED')
+      assert.equal(await run('current.runs[0].verification.status'), 'UNKNOWN')
       const encryptedSettings = fs.readFileSync(path.join(process.env.RPA_AGENT_TEST_DATA, 'settings.enc'), 'utf8')
       assert.ok(!encryptedSettings.includes('smoke-debug'))
       const config = await run('desktop.invoke("mcp:control", current.id, true)')
@@ -215,11 +275,20 @@ app.on('browser-window-created', (_event, win) => {
       win.webContents.reload(); await reloaded
       for (let tries = 0; tries < 40 && !await run('!!currentUser'); tries++) await new Promise(resolve => setTimeout(resolve, 50))
       await run(`(async()=>installWorkspace(await desktop.invoke('workspace:attach',${JSON.stringify(restoreSession)})))()`)
+      await run('setView("workspace")')
       assert.equal(await run('$("approval").hidden&&!approvals'),true)
-      await run(`(async()=>{ const dsl=structuredClone(current.dsl); dsl.steps.push({stepCode:'call-child',stepName:'调用子流程',actionCode:'subFlow',actionArgs:{flowName:'子流程'}}); current=await desktop.invoke('workspace:update',current.id,{dsl}); renderWorkspace() })()`)
+      await run(`(async()=>{ const dsl=structuredClone(current.dsl); dsl.steps.push(
+        {stepCode:'call-child',stepName:'调用子流程',actionCode:'subFlow',actionArgs:{flowName:'子流程'}},
+        {stepCode:'disabled-call',stepName:'禁用调用',actionCode:'subFlow',status:0,actionArgs:{flowName:'当前应用缺失的子流程'}}
+      ); current=await desktop.invoke('workspace:update',current.id,{dsl}); renderWorkspace() })()`)
       const child = await client.callTool({ name: 'get_subflow_context', arguments: { flowCode: 'child' } })
       assert.ok(!child.isError)
       const childContext = JSON.parse(child.content[0].text)
+      assert.equal(Object.hasOwn(childContext.dsl,'templateFlowCode'),false)
+      const flowList=await client.callTool({name:'list_app_flows',arguments:{}})
+      assert.ok(!JSON.stringify(flowList.content).includes('templateFlowCode'))
+      const retiredAction=await client.callTool({name:'get_action_detail',arguments:{actionCode:'start'}})
+      assert.equal(retiredAction.isError,true)
       const proposedChild = await client.callTool({ name: 'propose_dsl_patch', arguments: { flowCode: 'child', baseRevision: childContext.revision,
         operations: [{ op: 'set', stepCode: 'child-step', field: 'stepName', value: '修复后的子页面' },
           { op: 'insert', step: { stepCode: 'draft-template-call', stepName: '候选新增模板调用', actionCode: 'subFlow', actionArgs: { flowName: '模板末级' } } }] } })
@@ -227,6 +296,16 @@ app.on('browser-window-created', (_event, win) => {
       await run('refreshSnapshot()'); assert.equal(await run('current.proposal.targetFlowCode'), 'child')
       await run('direct("run_current_dsl")')
       assert.equal(lastDebugDsl.subflows.find(flow => flow.flowCode === 'child').steps.some(step => step.stepCode === 'draft-template-call'), false)
+      assert.equal(lastDebugDsl.steps.length, 2)
+      assert.ok(!lastDebugDsl.steps.some(step => step.stepCode === 'disabled-call'))
+      assert.equal(await run('current.dsl.steps.find(step => step.stepCode === "disabled-call").status'), 0)
+      const visibleDsl = await run('desktop.invoke("workspace:dsl",current.id)')
+      assert.deepEqual(visibleDsl.dsl.steps, lastDebugDsl.steps)
+      assert.deepEqual(visibleDsl.diagnostics, [])
+      assert.ok(!lastDebugDsl.subflows.some(flow => flow.flowName === '当前应用缺失的子流程'))
+      const archivedDsl = await run('desktop.invoke("workspace:execution-evidence",current.id,current.runs[0].artifactId).then(entry=>entry.dsl)')
+      assert.deepEqual(archivedDsl, lastDebugDsl)
+      await run('$("executionEvidenceDialog").close()')
       const beforeChangedApproval = requests.filter(item => item.path === '/api/robot/debug/runs').length
       const savedChildRows = JSON.parse(JSON.stringify(childRows))
       childRows[0].stepName = '执行前服务器子流程发生变化'
@@ -236,9 +315,23 @@ app.on('browser-window-created', (_event, win) => {
       assert.equal(requests.filter(item => item.path === '/api/robot/debug/runs').length, beforeChangedApproval)
       childRows = savedChildRows
       await run('direct("run_proposed_dsl")')
+      await run('$("executionEvidenceDialog").close()')
       assert.equal(lastDebugDsl.subflows[0].steps[0].stepName, '修复后的子页面')
       assert.equal(lastDebugDsl.subflows.find(flow => flow.flowName === '模板末级').flowCode, 'template-leaf')
-      await run('(async()=>{ current=await desktop.invoke("workspace:candidate",current.id,"apply"); current=await desktop.invoke("workspace:save",current.id); renderWorkspace() })()')
+      const rootBeforeApply=await run('JSON.stringify(current.dsl)')
+      await run('$("applyCandidate").click()');await wait('$("patchReviewDialog")?.open')
+      assert.equal(await run('JSON.stringify(current.dsl)'),rootBeforeApply)
+      await run('$("confirmApplyPatch").click()')
+      try{await wait('!$("patchReviewDialog")&&current.scope.flowCode==="child"')}
+      catch(error){
+        console.error(await run('({flow:current.scope.flowCode,staged:!!current.proposal,applying:$("confirmApplyPatch")?.disabled,tabs:workspaceTabs.size})'))
+        console.error(requests.slice(-8).map(item=>item.path))
+        throw error
+      }
+      assert.ok(await run('workspaceTabs.has(current.id)'))
+      assert.equal(await run('current.dsl.steps[0].stepName'),'修复后的子页面')
+      assert.notEqual(childRows[0].stepName,'修复后的子页面')
+      await run('(async()=>{current=await desktop.invoke("workspace:save",current.id);renderWorkspace()})()')
       assert.equal(childRows[0].stepName, '修复后的子页面')
       assert.equal(await run('current.scope.flowCode'), 'child')
       await client.close(); await run('desktop.invoke("mcp:control", current.id, false)')
@@ -248,6 +341,7 @@ app.on('browser-window-created', (_event, win) => {
       const rendererFields = await run(`window.argumentFields.visible(${JSON.stringify(h5Fields)},${JSON.stringify(h5Values)})`)
       assert.equal(rendererFields.find(field => field.fieldKey === 'inputType').hidden, true)
       await run('direct("run_current_dsl")')
+      await run('$("executionEvidenceDialog").close()')
       const submittedQr = lastDebugDsl.steps.find(step => step.stepCode === 'h5-qr')
       assert.equal(submittedQr.actionArgs.validateType, 'qrCode')
       assert.equal(submittedQr.actionArgs.qrCodeXpath, 'fixture')
@@ -255,15 +349,36 @@ app.on('browser-window-created', (_event, win) => {
       assert.equal(submittedQr.actionArgs.inputXpath, '')
       await run(`(async()=>{const dsl=structuredClone(current.dsl);dsl.steps.push({stepCode:'template-call',stepName:'调用引用模板',actionCode:'subFlow',actionArgs:{flowName:'引用模板'}});current=await desktop.invoke('workspace:update',current.id,{dsl});renderWorkspace()})()`)
       await run('direct("run_current_dsl")')
+      await run('$("executionEvidenceDialog").close()')
       assert.deepEqual(lastDebugDsl.subflows.map(flow => flow.flowName).sort(), ['引用模板', '医疗增员单个', '模板末级'].sort())
       assert.equal(lastDebugDsl.subflows.find(flow => flow.flowName === '医疗增员单个').steps[0].children[0].actionArgs.flowName, '模板末级')
-      assert.ok(requests.some(request => request.path.includes('templateFlowCode=template-body')))
+      assert.ok(!requests.some(request=>request.path.includes('templateFlowCode')||request.path.includes('listTemplate')))
       const readConfig = await run('desktop.invoke("mcp:control",current.id,true)')
       const readClient = new Client({ name: 'readonly-smoke', version: '1.0.0' })
       await readClient.connect(new StreamableHTTPClientTransport(new URL(readConfig.url), { requestInit: { headers: { Authorization: 'Bearer ' + readConfig.bearerToken } } }))
+      invalidLeafJump=true
       const referenced = await readClient.callTool({ name: 'get_subflow_context', arguments: { flowCode: 'template-child' } })
+      const beforeDslViewRuns=requests.filter(item=>item.path.includes('/robot/debug/runs')).length
+      const {dsl:fullDslView,diagnostics}=await run('desktop.invoke("workspace:dsl",current.id)')
+      assert.ok(Array.isArray(diagnostics));assert.equal(Object.hasOwn(fullDslView,'inspectionDiagnostics'),false)
+      assert.deepEqual(fullDslView.subflows.map(flow=>flow.flowName).sort(),['引用模板','医疗增员单个','模板末级'].sort())
+      assert.equal(fullDslView.subflows.find(flow=>flow.flowCode==='template-leaf').steps[0].skipTo,'退出浏览器')
+      assert.equal(requests.filter(item=>item.path.includes('/robot/debug/runs')).length,beforeDslViewRuns)
+      assert.equal(await run('current.dsl.subflows===undefined'),true)
+      await run('$("agentSessionMenuTrigger").click();$("showDsl").click()')
+      for(let i=0;i<100&&!await run('!!$("jsonViewerDialog")?.open');i++)await new Promise(resolve=>setTimeout(resolve,20))
+      assert.equal(await run('JSON.parse($("jsonViewerSource").value).subflows.length'),3)
+      assert.equal(await run('$("jsonViewerFlow").options.length'),4)
+      await run('$("jsonViewerFlow").value=[...$("jsonViewerFlow").options].find(option=>option.textContent.includes("医疗增员单个")).value;$("jsonViewerFlow").dispatchEvent(new Event("change"))')
+      assert.match(await run('$("jsonViewerDialog").querySelector(".json-viewer-tree").textContent'),/模板页面/)
+      assert.equal(await run('[...$("jsonViewerDialog").querySelectorAll("summary")].find(node=>node.textContent.includes("模板页面")).getClientRects().length>0'),true)
+      assert.equal(await run('JSON.parse($("jsonViewerSource").value).subflows.length'),3)
+      await run('$("jsonViewerDialog").querySelector(".json-viewer-heading button").click()')
+      invalidLeafJump=false
       assert.ok(!referenced.isError)
       assert.equal(JSON.parse(referenced.content[0].text).advisoryOnly, true)
+      assert.equal(JSON.parse(referenced.content[0].text).dsl.steps.length,1)
+      assert.deepEqual(JSON.parse(referenced.content[0].text).jumpDiagnostics,[])
       const referencedSteps = await readClient.callTool({ name: 'get_app_flow_steps', arguments: { flowCode: 'template-child' } })
       assert.ok(!referencedSteps.isError)
       const deniedRead = await readClient.callTool({ name: 'get_app_flow_steps', arguments: { flowCode: 'unrelated-flow' } })
@@ -279,55 +394,6 @@ app.on('browser-window-created', (_event, win) => {
       assert.ok(budgetSamples > 0 && budgetSamples <= 23)
       assert.ok(await run('current.turn.modelCalls<=24'))
       assert.equal(requests.filter(request => request.path === '/api/robot/debug/runs').length, beforeConclusionRuns)
-      // Exercise actual forms, IPC, inert row extraction, reconciliation and encrypted knowledge.
-      await run('(async()=>{current=await desktop.invoke("workspace:update",current.id,{taskCode:"task"});$("businessContext").click()})()')
-      for (let tries = 0; tries < 30 && !await run('$("businessDialog").open'); tries++) await new Promise(resolve => setTimeout(resolve, 50))
-      assert.equal(await run('$("businessDialog").open'), true)
-      await run(`(async()=>{
-        const values={region:'示例地区',system:'示例网厅',businessType:'汇缴',account:'unit1',period:'2026-11',personCount:'2',amount:'100'};
-        for(const [key,value] of Object.entries(values))$('businessFields').querySelector('[name="'+key+'"]').value=value;
-        await $('businessForm').onsubmit({preventDefault(){}});
-      })()`)
-      assert.equal(await run('$("businessDialog").open'), false)
-      const businessRules = [
-        { id: 'account', type: 'textEquals', businessField: 'account', selector: '#account', expected: 'unit1' },
-        { id: 'period', type: 'textEquals', businessField: 'period', selector: '#period', expected: '2026-11' },
-        { id: 'count', type: 'numberEquals', businessField: 'personCount', selector: '#count', expected: 2 },
-        { id: 'amount', type: 'numberEquals', businessField: 'amount', selector: '#amount', expected: 100 },
-        { id: 'state', type: 'businessState', selector: '#officialState', acceptedValues: ['已入账'], pendingValues: ['审核中'] },
-        { id: 'people', type: 'recordSet', selector: 'tr', keySelector: '.person', valueSelector: '.state', pendingValues: ['审核中'], records: [{ key: 'p1', value: '已入账' }, { key: 'p2', value: '已入账' }] }
-      ]
-      await run(`(async()=>{current=await desktop.invoke('workspace:assertions',current.id,${JSON.stringify(businessRules)})})()`)
-      officialBusinessState = '审核中'; await run('direct("run_current_dsl")')
-      assert.equal(await run('current.runs[0].verification.status'), 'PENDING')
-      assert.equal(await run('current.runs[0].verification.details.find(item=>item.id==="people").counts.PENDING'), 1)
-      await assert.rejects(run('desktop.invoke("business-knowledge:archive",current.id)'), /业务已验证/)
-      officialBusinessState = '已入账'; await run('direct("run_current_dsl")')
-      assert.equal(await run('current.runs[0].verification.status'), 'VERIFIED')
-      assert.deepEqual(await run('current.runs[0].verification.coverage.missing'), [])
-      await run('desktop.invoke("business-knowledge:archive",current.id)')
-      changedTemplateLeaf = true
-      try { await assert.rejects(run('desktop.invoke("business-knowledge:archive",current.id)'), /子流程已变化/) }
-      finally { changedTemplateLeaf = false }
-      const ruleFile = path.join(process.env.RPA_AGENT_TEST_DATA, 'rules.json')
-      const today = new Date().toISOString().slice(0,10)
-      fs.writeFileSync(ruleFile, JSON.stringify([{ id:'example',title:'示例规则',region:'示例地区',system:'示例网厅',businessType:'汇缴',source:'测试用规则来源',effectiveFrom:'2020-01-01',effectiveTo:'2099-12-31',verifiedAt:today,preconditions:['核对主体'],successCriteria:['官方状态明确'],rejectionAdvice:[] }]))
-      const originalOpen = dialog.showOpenDialog
-      try {
-        dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [ruleFile] })
-        assert.equal((await run('desktop.invoke("business-knowledge:import-rules",current.id)')).count, 1)
-      } finally { dialog.showOpenDialog = originalOpen }
-      const businessConfig = await run('desktop.invoke("mcp:control",current.id,true)')
-      const businessClient = new Client({ name:'business-smoke',version:'1.0.0' })
-      await businessClient.connect(new StreamableHTTPClientTransport(new URL(businessConfig.url), { requestInit:{headers:{Authorization:'Bearer '+businessConfig.bearerToken}} }))
-      const rulesReply = await businessClient.callTool({ name:'search_business_rules',arguments:{query:''} })
-      assert.equal(JSON.parse(rulesReply.content[0].text).rules.length, 1)
-      const casesReply = await businessClient.callTool({ name:'search_experience',arguments:{query:''} })
-      assert.equal(JSON.parse(casesReply.content[0].text).cases[0].status, 'VERIFIED_OUTCOME')
-      await businessClient.close(); await run('desktop.invoke("mcp:control",current.id,false)')
-      await run('$("businessDiagnosis").click()')
-      assert.match(await run('$("businessFields").textContent'), /p2：PASSED/)
-      await run('$("businessDialog").close()')
       duplicateIdentityTest = true
       rows = [
         { id: 101, stepCode: 'reused', stepName: '读取单位页面', actionCode: 'page', level: 0, actionArgs: '{"actionType":"access","actionArgs":"https://example.test/unit"}' },
@@ -342,23 +408,80 @@ app.on('browser-window-created', (_event, win) => {
       assert.equal(await run('new Set(current.dsl.steps.flatMap(step=>[step.stepCode,...(step.children||[]).map(child=>child.stepCode)])).size'), 3)
       assert.match(await run('$("notice").textContent'), /重复或缺失编码/)
       const repairedIdentity = await run('current.dsl.steps[0].children[0].stepCode')
-      await run('openFlow(current.id)')
+      await run('(async()=>installWorkspace(await desktop.invoke("workspace:attach",current.id)))()')
       assert.equal(await run('current.dsl.steps[0].children[0].stepCode'), repairedIdentity)
       await run('desktop.invoke("workspace:save",current.id)')
       assert.equal(rows.length, 3)
       assert.deepEqual(rows.map(row => row.id), [101, 102, 103])
       assert.equal(rows.some(row => Object.hasOwn(row, 'sourceStepCode')), false)
-      await run('openFlow(current.id)')
+      await run('(async()=>installWorkspace(await desktop.invoke("workspace:attach",current.id)))()')
       assert.equal(await run('current.dsl.steps[0].children[0].stepCode'), repairedIdentity)
       await run('setView("workspace")')
       assert.equal(await run('getComputedStyle(document.getElementById("workspace")).display!=="none"'), true)
+      emptyBlockTest=true
+      const emptyOpened=await run('desktop.invoke("workspace:open",{appCode:"app",flowCode:"empty-block",executor:current.scope.executor})')
+      assert.equal(emptyOpened.session.dsl.steps[0].stepName,'账号密码登录')
+      await run(`installWorkspace(${JSON.stringify(emptyOpened)})`)
+      assert.ok(await run('$("stepTree").textContent.includes("账号密码登录")'))
+      const invalidSave=await run('desktop.invoke("workspace:save",current.id).then(()=>"unexpected",error=>error.message)')
+      assert.match(invalidSave,/没有步骤/)
+      await run('(async()=>{const dsl=structuredClone(current.dsl);dsl.steps[0].body=[{stepCode:"login-child",stepName:"访问登录页",actionCode:"page",actionArgs:{actionType:"access",actionArgs:"https://example.test/login"}}];current=await desktop.invoke("workspace:update",current.id,{dsl});current=await desktop.invoke("workspace:save",current.id);renderWorkspace()})()')
+      assert.equal(emptyBlockRows.length,2)
+      assert.equal(emptyBlockRows[1].stepName,'访问登录页')
+      const templateOpened=await run('desktop.invoke("workspace:open",{appCode:"app",flowCode:"template-alias",executor:current.scope.executor})')
+      assert.equal(templateOpened.session.dsl.steps.length,1)
+      assert.equal(templateOpened.session.dsl.steps[0].actionArgs.flowName,'医疗增员单个')
+      assert.ok(!requests.some(request=>/listTemplate|getByFlowCode|templateFlowCode|templateType/.test(request.path)))
+      await run('(async()=>{const opened=await desktop.invoke("workspace:open",{appCode:"app",flowCode:"flow",executor:current.scope.executor});installWorkspace(opened);setView("workspace");await showDebugExecutionDetails(current.id,null,"dsl")})()')
+      assert.equal(await run('current.runs.length'), 0)
+      assert.ok(await run('$("executionEvidenceRun").options.length >= 2'))
+      assert.match(await run('$("executionEvidencePanel").textContent'), /flowCode|flowName/)
+      await run('$("executionEvidenceRun").selectedIndex=1;$("executionEvidenceRun").dispatchEvent(new Event("change"))')
+      await wait('$("executionEvidencePanel").textContent.includes("flowCode")')
+      await run('$("executionEvidenceDialog").close()')
+      const firstId = await run('current.id')
+      await run('desktop.invoke("workspace:update",current.id,{taskCode:"task"})')
+      holdDebug = true
+      const firstRun = run('desktop.invoke("agent:start",current.id,{directTool:{name:"run_current_dsl"}})')
+      for (let attempt = 0; attempt < 100 && !releaseDebug; attempt++) await new Promise(resolve => setTimeout(resolve, 20))
+      assert.ok(releaseDebug)
+      await run('setView("flowManagement");$("flow").value="template-alias";openFlow()')
+      await wait('current.scope.flowCode==="template-alias"&&!taskLoading')
+      const secondId = await run('current.id')
+      await run('desktop.invoke("workspace:update",current.id,{taskCode:"task"})')
+      const busyRun = await run('desktop.invoke("agent:start",current.id,{directTool:{name:"run_current_dsl"}}).then(()=>"unexpected",error=>error.message)')
+      assert.match(busyRun, /执行器已有任务/)
+      const remote = await run(`desktop.invoke("workspace:open",{appCode:"app",flowCode:"template-alias",executor:${JSON.stringify(secondEndpoint)}})`)
+      await run(`installWorkspace(${JSON.stringify(remote)});setView("workspace")`)
+      await run('desktop.invoke("workspace:update",current.id,{taskCode:"task"})')
+      const secondResult = await run('desktop.invoke("agent:start",current.id,{directTool:{name:"run_current_dsl"}})')
+      assert.equal(secondResult.status, 'SUCCEEDED')
+      assert.equal(await run(`desktop.invoke("agent:snapshot",${JSON.stringify(firstId)}).then(value=>value.state)`), 'running')
+      await run(`switchWorkspaceTab(${JSON.stringify(firstId)})`)
+      await run(`switchWorkspaceTab(${JSON.stringify(secondId)})`)
+      releaseDebug()
+      await firstRun
+      await run(`switchWorkspaceTab(${JSON.stringify(firstId)})`)
+      assert.equal(await run('current.state'), 'completed')
+      assert.match(await run('$("timeline").textContent'), /调试成功/)
+      const removedId = await run('current.runs[0].artifactId')
+      await run('showDebugExecutionDetails(current.id,current.runs[0].artifactId)')
+      const countBeforeDelete = await run('$("executionEvidenceRun").options.length')
+      const originalMessageBox = dialog.showMessageBox
+      dialog.showMessageBox = async () => ({ response: 1 })
+      try {
+        await run('$("executionEvidenceDialog").querySelector("button.danger").click()')
+        await wait('$("executionEvidenceRun").options.length===' + (countBeforeDelete - 1) + '&&!$("executionEvidenceDialog").querySelector("button.danger").disabled')
+      } finally { dialog.showMessageBox = originalMessageBox }
+      await run('$("executionEvidenceDialog").close()')
+      assert.equal(await run(`desktop.invoke("workspace:execution-evidence",current.id,null).then(rows=>rows.some(row=>row.id===${JSON.stringify(removedId)}))`), false)
       const shot = await win.webContents.capturePage(); fs.writeFileSync(path.join(artifactDirectory, 'workbench.png'), shot.toPNG())
       assert.deepEqual(errors, [])
       assert.equal(cancelled, false)
       fs.writeFileSync(path.join(artifactDirectory, 'electron-smoke.json'), JSON.stringify({ passed: true, requests, checks: ['secure-preload', 'safeStorage', 'platform-auth', 'load-flow', 'native-edit', 'save', 'mock-model-tool-loop', 'candidate-review', 'mock-debug', 'business-assertion', 'external-artifact', 'session-restore', 'MCP-auth', 'MCP-tool', 'MCP-execution-without-confirmation', 'turn-steering', 'refresh-attach-execution-history', 'model-execution-without-confirmation', 'single-line-tool-events', 'changed-dependency-rejected', 'subflow-context', 'subflow-patch', 'subflow-candidate-run', 'subflow-apply-save', 'platform-window'] }, null, 2))
-      console.log('Electron integration passed: native UI, IPC, safeStorage, mock platform/executor, save/restore, business assertions and authenticated MCP.')
-      clearTimeout(deadline); server.close(); app.exit(0)
-    } catch (error) { console.error(error.stack); console.error(errors); clearTimeout(deadline); server.close(); app.exit(1) }
+      console.log('Electron integration passed: native UI, IPC, safeStorage, mock platform/executor, workspace restore, execution evidence and authenticated MCP.')
+      clearTimeout(deadline); server.close(); secondExecutor.close(); app.exit(0)
+    } catch (error) { console.error(error.stack); console.error(errors); clearTimeout(deadline); server.close(); secondExecutor.close(); app.exit(1) }
   })
 })
 require('../src/main')

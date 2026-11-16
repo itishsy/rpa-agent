@@ -5,6 +5,15 @@ const { completeChat } = require('../src/services/ai-model-client')
 const { validateModelSettings } = require('../src/services/model-settings')
 const settings = { modelBaseUrl: 'http://model.test/v1', modelName: 'fixture' }
 const input = { messages: [{ role: 'system', content: 'rules' }, { role: 'user', content: 'request' }], tools: [] }
+
+test('generation tool choice is sent to the model and closing still disables tools',async()=>{
+  const choice={type:'function',function:{name:'propose_dsl_patch'}}
+  for(const finalOnly of [false,true])await completeChat(settings,'',{...input,toolChoice:choice,finalOnly},async(_,options)=>{
+    const body=JSON.parse(options.body)
+    assert.deepEqual(body.tool_choice,finalOnly?'none':choice)
+    return {ok:true,text:async()=>JSON.stringify({choices:[{finish_reason:'stop',message:{content:'done'}}]})}
+  })
+})
 test('model settings validation leaves saved-secret decisions to the caller', () => {
   const input = { modelName: 'model', modelBaseUrl: 'https://example.test/v1', modelApiKey: '', clearModelApiKey: true }
   const original = structuredClone(input)
@@ -76,4 +85,36 @@ test('request transport omits legacy empty tool_calls without changing the trans
   })
   assert.equal(Object.hasOwn(result.message,'tool_calls'),false)
   assert.equal(JSON.stringify(messages),before)
+})
+
+test('thinking tool turns retain reasoning through history normalization and transport', async () => {
+  const { normalizeHistory } = require('../src/agent/history')
+  const calls=[{id:'read',type:'function',function:{name:'queue_status',arguments:'{}'}}]
+  const response=await complete('tool_calls',{content:'',reasoning_content:'provider reasoning payload',tool_calls:calls})
+  assert.equal(response.message.reasoning_content,'provider reasoning payload')
+  const messages=normalizeHistory([...input.messages,
+    {role:'assistant',content:'',tool_calls:[{...calls[0],id:'synthetic'}]},
+    {role:'tool',tool_call_id:'synthetic',content:'{}'},response.message,{role:'tool',tool_call_id:'read',content:'{}'}])
+  const before=JSON.stringify(messages)
+  await completeChat(settings,'',{...input,messages},async(_,options)=>{
+    const sent=JSON.parse(options.body).messages.filter(message=>message.role==='assistant')
+    assert.equal(sent[0].reasoning_content,'')
+    assert.equal(sent[1].reasoning_content,'provider reasoning payload')
+    return {ok:true,text:async()=>JSON.stringify({choices:[{finish_reason:'stop',message:{content:'分析完成'}}]})}
+  })
+  assert.equal(JSON.stringify(messages),before)
+})
+
+test('missing reasoning_content on legacy tool history retries once without replaying tools', async () => {
+  const messages=[...input.messages,{role:'assistant',content:'',tool_calls:[{id:'initial',type:'function',function:{name:'queue_status',arguments:'{}'}}]},
+    {role:'tool',tool_call_id:'initial',content:'{"records":[]}'}]
+  let attempts=0
+  const result=await completeChat(settings,'',{...input,messages},async(_,options)=>{
+    attempts++
+    if(attempts===1)return {ok:false,status:400,text:async()=>'{"error":{"message":"The reasoning_content in the thinking mode must be passed back"}}'}
+    assert.equal(JSON.parse(options.body).messages[2].reasoning_content,'')
+    return {ok:true,text:async()=>JSON.stringify({choices:[{finish_reason:'stop',message:{content:'证据不足'}}]})}
+  })
+  assert.equal(attempts,2);assert.equal(result.message.content,'证据不足')
+  assert.equal(Object.hasOwn(messages[2],'reasoning_content'),false)
 })

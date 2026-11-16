@@ -1,0 +1,48 @@
+'use strict'
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { randomUUID } = require('node:crypto')
+const { SessionStore } = require('../src/agent-core/store')
+const { ExecutionEvidence } = require('../src/services/execution-evidence')
+
+test('flow evidence restores legacy artifacts, retains five runs and survives reopening', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rpa-evidence-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const codec = { encrypt: text => Buffer.from(text).toString('base64'), decrypt: text => Buffer.from(text, 'base64').toString() }
+  const createStore = () => new SessionStore(path.join(root, 'sessions'), codec)
+  const createArchive = store => new ExecutionEvidence(path.join(root, 'evidence'), codec, store)
+  const scope = { platformId: 'user', username: 'first', platformUrl: 'http://platform.test', executor: 'http://robot.test', appCode: 'app', flowCode: 'flow' }
+  const run = number => ({ artifactId: randomUUID(), at: new Date(number * 1000).toISOString(), result: { executionCode: 'run-' + number } })
+  const store = createStore()
+  const legacy = store.create(scope, { steps: [] })
+  const initial = run(0)
+  legacy.runs.push(initial)
+  legacy.artifacts[initial.artifactId] = store.writeArtifact(legacy.id, initial.artifactId, { details: [{ stepName: '旧记录' }] })
+  store.save(legacy)
+  const archive = createArchive(store)
+  assert.equal(archive.get(scope, archive.list(scope)[0].id).result.details[0].stepName, '旧记录')
+  archive.remove(scope, initial.artifactId, new Map([[legacy.id, legacy]]))
+  assert.deepEqual(createArchive(createStore()).list(scope), [])
+  assert.equal(legacy.runs[0].evidenceState, 'deleted')
+  assert.throws(() => store.readArtifact(legacy.id, initial.artifactId), { code: 'ENOENT' })
+  for (let index = 1; index <= 6; index++) {
+    const record = run(index)
+    archive.record(scope, record, { ...record.result, snapshots: [{ ctx: { token: 'sensitive' } }] }, { steps: [{ stepName: '步骤 ' + index }] })
+  }
+  const reopened = createArchive(createStore())
+  const sameFlow = { ...scope, executor: 'http://another-robot.test' }
+  const entries = reopened.list(sameFlow)
+  assert.deepEqual(entries.map(item => item.executionCode), ['run-6', 'run-5', 'run-4', 'run-3', 'run-2'])
+  const payload = reopened.get(sameFlow, entries[0].id)
+  assert.equal(payload.dsl.steps[0].stepName, '步骤 6')
+  assert.equal(payload.result.snapshots[0].ctx.token, '[REDACTED]')
+  assert.throws(() => reopened.get({ ...scope, username: 'second' }, entries[0].id), /最近五次/)
+  assert.throws(() => reopened.get(scope, initial.artifactId), /最近五次/)
+  assert.equal(fs.readdirSync(reopened.folder(scope)).length, 6)
+  reopened.remove(scope, entries[0].id, new Map())
+  assert.equal(createArchive(createStore()).list(scope).length, 4)
+  assert.throws(() => reopened.get(scope, entries[0].id), /最近五次/)
+})

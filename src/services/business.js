@@ -1,4 +1,5 @@
 'use strict'
+const {flowMetadata}=require('./flow-metadata')
 const text = value => String(value ?? '').trim()
 const object = value => {
   const parsed = typeof value === 'string' ? JSON.parse(value || '{}') : value || {}
@@ -8,13 +9,21 @@ const object = value => {
 const rowsOf = data => Array.isArray(data) ? data : ['rows', 'records', 'list'].map(key => data?.[key]).find(Array.isArray) || []
 const required = (value, label) => { if (!text(value)) throw new Error('请填写' + label); return text(value) }
 const integer = (value, low, high, label) => { const n = Number(value); if (!text(value) || !Number.isInteger(n) || n < low || n > high) throw new Error(label + '范围为' + low + '至' + high); return n }
-const WRITES = new Set(['saveApplication', 'releaseApplication', 'offlineApplication', 'statusApplication', 'syncApplication', 'activateVersion', 'saveFlow', 'deleteFlow', 'orderFlow', 'organizeFlows', 'statusFlow'])
+const WRITES = new Set(['saveApplication', 'releaseApplication', 'releaseToProduction', 'offlineApplication', 'statusApplication', 'syncApplication', 'activateVersion', 'saveFlow', 'deleteFlow', 'orderFlow', 'organizeFlows', 'statusFlow'])
+function nextReleaseVersion(version, rule) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/i.exec(text(version))
+  const index = ['主版本号', '子版本号', '补丁'].indexOf(rule)
+  if (!match || index < 0) return ''
+  const parts = match.slice(1).map(Number)
+  parts[index]++
+  return 'V' + parts.join('.')
+}
 function createBusinessService(request) {
   const listFlows = async input => {
     const result = await request({ path: 'robot/flow/list', body: { appCode: required(input.appCode, '应用编码'),
       flowTypeList: input.flowTypeList || [1, 2], serviceItemList: input.serviceItemList || [], declareSystemList: input.declareSystemList || [] } })
     if (!Array.isArray(result)) throw new Error('流程列表返回格式无效')
-    return result
+    return result.map(flowMetadata)
   }
   async function ownedFlow(input) {
     const list = await listFlows({ appCode: input.appCode })
@@ -59,6 +68,36 @@ function createBusinessService(request) {
       return request({ path: 'robot/app/release', body: { appCode: required(input.appCode, '应用编码'), rule: input.rule,
         changeReason: required(input.changeReason, '变更原因'), comment } })
     },
+    async releaseToProduction(input) {
+      const appCode = required(input.appCode, '应用编码')
+      const comment = required(input.comment, '更新内容')
+      if (comment.length > 500) throw new Error('更新内容不能超过500字')
+      const app = await actions.application({ appCode })
+      const previousVersion = text(app.version)
+      const expectedRelease = input.syncOnly ? previousVersion : nextReleaseVersion(previousVersion, input.rule)
+      const matchesRelease = version => expectedRelease ? version.toLowerCase() === expectedRelease.toLowerCase() : !!version && version !== previousVersion
+      if (previousVersion !== text(input.expectedVersion)) throw new Error('应用版本已变化，请关闭弹窗并重新查看当前版本')
+      if (!input.syncOnly) {
+        if (Number(app.flowCount) === 0 || (app.flowCount == null && !(await listFlows({ appCode })).length)) {
+          throw new Error('该应用无流程，无法上线')
+        }
+        await actions.releaseApplication({ ...input, appCode, comment })
+      } else if (!previousVersion) {
+        throw new Error('无法确认已发布的版本')
+      }
+      let version = input.syncOnly ? previousVersion : ''
+      try {
+        if (!input.syncOnly) {
+          const latest = await actions.application({ appCode })
+          version = text(latest.version)
+          if (!matchesRelease(version)) throw new Error('平台尚未返回本次发布的版本，请重新读取版本后重试同步')
+        }
+        await actions.syncApplication({ appCode, comment })
+        return { synced: true, version }
+      } catch (error) {
+        return { synced: false, version: matchesRelease(version) ? version : '', expectedRelease, error: error.message }
+      }
+    },
     offlineApplication: input => request({ path: 'robot/app/offlineStatus', params: { appCode: required(input.appCode, '应用编码'),
       appStatus: integer(input.appStatus, 0, 6, '下架后状态'), comment: required(input.comment, '下架原因') } }),
     statusApplication: input => request({ path: 'robot/app/updateAppStatus', params: { appCode: required(input.appCode, '应用编码'),
@@ -67,25 +106,24 @@ function createBusinessService(request) {
     versions: input => request({ path: 'robot/app/history', params: { appCode: required(input.appCode, '应用编码') } }),
     activateVersion: input => request({ path: 'robot/app/activate', params: { appCode: required(input.appCode, '应用编码'), version: required(input.version, '版本号') } }),
     flows: listFlows,
-    flowSources: input => request({ path: 'robot/flow/showOneAppFlow', params: input.appCode ? { appCode: input.appCode } : {} }),
-    templates: () => request({ path: 'robot/flow/listTemplate', params: { templateType: 1, flowType: 1 } }),
+    flowSources: async input => rowsOf(await request({ path: 'robot/flow/showOneAppFlow', params: input.appCode ? { appCode: input.appCode } : {} })).map(flowMetadata),
     async saveFlow(input) {
       const mode = input.mode || 'add'
-      if (!['add', 'edit', 'copyAdd', 'relateAdd'].includes(mode)) throw new Error('流程添加方式无效')
+      if (!['add', 'edit', 'copyAdd'].includes(mode)) throw new Error('流程添加方式无效')
       const appCode = required(input.appCode, '应用编码'), flowName = required(input.flowName, '流程名称')
       const flowType = integer(input.flowType ?? 1, 1, 2, '流程类型')
       const flows = await listFlows({ appCode })
       if (flows.some(row => text(row.flowName) === flowName && (mode !== 'edit' || row.flowCode !== input.flowCode))) throw new Error('流程名称不能重复')
       const fields = { appCode, flowName, flowType, serviceItem: flowType === 2 ? '' : input.serviceItem || '',
         declareSystem: required(input.declareSystem, '申报系统'), runSupport: required(input.runSupport, '运行载体'),
-        templateFlowCode: input.templateFlowCode || '', tagCode: input.tagCode || '' }
+        tagCode: input.tagCode || '' }
       if (mode === 'edit') {
         const row = flows.find(item => item.flowCode === input.flowCode); if (!row) throw new Error('流程已变化，请刷新')
         return request({ path: 'robot/flow/editFlow', body: { ...fields, id: row.id, flowCode: row.flowCode } })
       }
       if (mode !== 'add') {
         const source = required(input.sourceFlowCode, '来源流程')
-        const sources = mode === 'relateAdd' ? flows : rowsOf(await actions.flowSources({}))
+        const sources = rowsOf(await actions.flowSources({}))
         if (!sources.some(row => row.flowCode === source)) throw new Error('来源流程不存在或不在允许范围')
         fields.flowCode = source; fields.flowType = ''
       }

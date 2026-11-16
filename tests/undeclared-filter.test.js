@@ -45,10 +45,22 @@ test('multiple include and exclude rules combine with AND and retain payment tog
 
 test('blank rules are ignored and legacy saved filters migrate', () => {
   assert.deepEqual(normalizeFilter({ appName: '社保', includePayFee: false }), {
-    rules: [{ field: 'appName', operator: 'contains', keyword: '社保' }], includePayFee: false
+    rules: [{ field: 'appName', operator: 'contains', keyword: '社保', enabled: true }], includePayFee: false
   })
   assert.deepEqual(normalizeFilter({ rules: [{ field: 'taskStatus', operator: 'notContains', keyword: '  ' }] }).rules, [])
   assert.deepEqual(normalizeFilter({ rules: [{ field: 'appName', operator: 'contains', keyword: '，, ' }] }).rules, [])
+})
+
+test('disabled rules survive normalization and are excluded from results and labels', () => {
+  const candidates = [{ appName: '武汉-社保' }, { appName: '南京-社保' }]
+  const rule = { field: 'appName', operator: 'contains', keyword: '南京', enabled: false }
+  const saved = normalizeFilter({ rules: [rule] })
+  assert.deepEqual(saved.rules, [rule])
+  assert.deepEqual(filterRows(candidates, saved), candidates)
+  assert.deepEqual(filterLabels(saved), [])
+  saved.rules[0].enabled = true
+  assert.deepEqual(filterRows(candidates, saved), [candidates[1]])
+  assert.deepEqual(filterLabels(saved), ['应用包含南京'])
 })
 
 test('comma separated keywords match any included term and exclude every listed term', () => {

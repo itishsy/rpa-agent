@@ -1,6 +1,6 @@
 'use strict'
 let stepDrag=null,stepInsertTarget=null,stepNoticeTimer
-function stepEditingBlocked(){return !current||current.readOnly||workspaceOpening||productionRunning||current.productionRunning||['running','waiting_approval','stopping'].includes(current.state)}
+function stepEditingBlocked(){return !current||current.readOnly||workspaceOpening||productionRunningFor(current)||['running','waiting_approval','stopping'].includes(current.state)}
 function showStepNotice(message,error=false){
   if(message.startsWith('流程已打开')||message.startsWith('已登录：')||$('stepPropertiesDialog').open)return
   $('stepToast').textContent=message;$('stepToast').className=error?'step-toast error':'step-toast';$('stepToast').hidden=false

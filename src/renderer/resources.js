@@ -14,17 +14,14 @@ window.resourceGroups = [
     ['应用状态调整', 'robot/app/updateAppStatus', {}, { appCode: '$appCode' }, true],
     ['下线应用', 'robot/app/offlineStatus', {}, { appCode: '$appCode' }, true]
   ] },
-  { name: '流程与模板', items: [
+  { name: '流程管理', items: [
     ['流程列表', 'robot/flow/list', { appCode: '$appCode' }],
     ['添加流程', 'robot/flow/add', undefined, { appCode: '$appCode', flowName: '', flowType: 1, serviceItem: '', declareSystem: '', runSupport: '' }, true],
     ['编辑流程', 'robot/flow/editFlow', { id: '', appCode: '$appCode', flowCode: '$flowCode', flowName: '', flowType: 1, serviceItem: '', declareSystem: '', runSupport: '' }, {}, true],
     ['复制流程', 'robot/flow/copyAdd', undefined, { appCode: '$appCode', flowCode: '$flowCode', flowName: '', flowType: '' }, true],
-    ['关联流程', 'robot/flow/relateAdd', undefined, { appCode: '$appCode', flowName: '', flowCode: '', flowType: '' }, true],
     ['删除流程', 'robot/flow/delete', undefined, { flowCode: '$flowCode' }, true],
     ['流程状态', 'robot/flow/editFlowStatus', { id: '', appCode: '$appCode', flowCode: '$flowCode', status: 1, comment: '' }, {}, true],
     ['流程状态历史', 'robot/flow/statusHistory', { appCode: '$appCode', flowCode: '$flowCode', historyType: 2 }, {}],
-    ['模板列表', 'robot/flow/listTemplate', undefined, { templateType: 1, flowType: 1 }],
-    ['同步模板', 'robot/flowDesign/syncOut', undefined, { comment: '' }, true]
   ] },
   { name: '执行计划', items: [
     ['计划列表', 'robot/flow/flowScheduleList', {}, { appCode: '$appCode' }],

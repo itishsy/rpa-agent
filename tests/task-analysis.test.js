@@ -2,6 +2,56 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { analyzeTask, localTime, resolveTask } = require('../src/services/task-analysis')
 const { sanitize } = require('../src/services/task-analysis')
+
+test('已停用户直接返回停用原因，不要求模型或数据源配置，也不定位缺失任务编号',async()=>{
+  let result,saved;const progress=[]
+  const reason=await analyzeTask({appName:'武汉-社保',accountNumber:'acc',taskStatus:' 已停用 ',taskComment:'用户不扫码'},null,{}, {
+    now:new Date('2026-11-10T04:00:00Z'),snapshotAt:Date.parse('2026-11-10T03:59:00Z'),
+    request:async()=>{throw Error('不应查询接口')},complete:async()=>{throw Error('不应调用模型')},
+    store:{save:value=>saved=value},onResult:value=>result=value,onProgress:value=>progress.push(value)
+  })
+  assert.match(reason,/已停用/);assert.match(reason,/用户不扫码/)
+  assert.equal(result.state,'completed');assert.equal(result.category,'任务调度')
+  assert.equal(result.ruleCode,'TASK_DISABLED');assert.equal(result.modelCalls,0);assert.equal(result.tools,0)
+  assert.equal(result.flowConfigurationIssue,false);assert.equal(result.handoff,undefined)
+  assert.equal(saved.artifacts[result.details[0].evidenceId].facts[0].at,'2026-11-10T03:59:00.000Z')
+  assert.equal(progress.at(-1).stage,'complete')
+})
+
+test('停用原因缺失或内嵌在状态中时直接给出准确结论，凭据不进入结果',async()=>{
+  for(const [status,comment,expected] of [
+    ['已停用','','当前任务列表未提供'],
+    ['已停用（UKey未插入）','','UKey未插入'],
+    ['已停用','Bearer private-token','[REDACTED]']
+  ]){
+    const reason=await analyzeTask({appName:'武汉-社保',accountNumber:'acc',taskStatus:status,taskComment:comment},null,{})
+    assert.ok(reason.includes(expected));assert.ok(!reason.includes('private-token'))
+  }
+})
+
+test('未明确停用的状态仍走正常分析，已取消的停用任务不发布结论',async()=>{
+  for(const taskStatus of ['已启用','正在执行','未停用','未知','']){
+    await assert.rejects(analyzeTask({appCode:'a',taskCode:'t',accountNumber:'acc',taskStatus},{},{}),/配置大模型/)
+  }
+  const controller=new AbortController();controller.abort()
+  await assert.rejects(analyzeTask({appName:'武汉-社保',accountNumber:'acc',taskStatus:'已停用'},null,{},
+    {signal:controller.signal,onResult:()=>assert.fail('不应回填已停止任务')}),/已停止/)
+})
+
+test('仅明确且唯一的流程配置分类允许显示接管入口',async()=>{
+  for(const [text,allowed] of [
+    ['定位参数失效。\n原因分类：流程配置',true],
+    ['等待验证码。\n原因分类：等待操作',false],
+    ['证据不足，不能确定是否为流程配置问题。',false],
+    ['原因分类：流程配置\n原因分类：证据不足',false]
+  ]){
+    let analysis
+    await analyzeTask({appCode:'a',taskCode:'t',accountNumber:'n'},{},{},{
+      request:async()=>({data:[]}),complete:async()=>({completionStatus:'complete',message:{role:'assistant',content:text}}),onResult:value=>analysis=value
+    })
+    assert.equal(analysis.flowConfigurationIssue,allowed,text)
+  }
+})
 test('诊断限定任务范围并拒绝任意模板uuid', async () => {
   const paths = [], replies = []
   let turn = 0
@@ -14,7 +64,7 @@ test('诊断限定任务范围并拒绝任意模板uuid', async () => {
     }
   })
   assert.equal(result, '证据不足')
-  assert.equal(paths.length, 2)
+  assert.equal(paths.length, 3)
   assert.equal(paths[0].body.execEndTime, '2026-11-07 00:00:00')
   assert.match(replies[1].at(-1).content, /只能查询/)
   assert.ok(paths.every(item => !item.path.includes('declareOfferExportPage')))
@@ -133,4 +183,49 @@ test('Harness使用当前模型连续取证并返回最终结论', async () => {
   assert.ok(paths.includes('policy/offerSettings/columnRuleList/allowed'))
   assert.ok(progress.some(event=>event.stage==='tool'))
   assert.equal(progress.at(-1).stage,'complete')
+})
+
+test('未执行任务核对有效计划、申报期和入队约束，隔离其他账户及地区',async()=>{
+  const requests=[],contexts=[];let turn=0,result
+  await analyzeTask({appCode:'a',taskCode:'t',accountNumber:'acc',clientId:7,machineCode:'m',addrId:9,businessType:1},{},{},{
+    now:new Date('2026-11-09T04:00:00Z'),onResult:value=>result=value,
+    request:async(_,path,body)=>{
+      requests.push({path,body})
+      if(path.includes('showServiceItemFlow'))return {data:[{serviceItem:1,status:1,execPlant:'每月15-20号',noDeclaredCount:3}]}
+      if(path.includes('getRobotPlant'))return {data:[
+        {appCode:'a',taskCode:'t',accountNumber:'acc',scheduleList:[{appCode:'a',taskCode:'t',execCycle:'15-20',execStyle:3},{appCode:'a',taskCode:'other',comment:'FOREIGN_PLAN'}]},
+        {appCode:'a',taskCode:'other',accountNumber:'other',comment:'FOREIGN_ACCOUNT'}]}
+      if(path.includes('getPolicyAddrDeadlineSettings'))return {data:[
+        {addrId:9,businessType:1,declareType:1,monthBegin:0,monthEnd:0,dayBegin:15,dayEnd:20},
+        {addrId:8,businessType:1,declareType:1,comment:'FOREIGN_REGION'}]}
+      if(path.includes('getRobotTaskConfigInfo'))return {data:[{groupName:'登录',args:[{argsKey:'declareWebsite',argsValue:'site'}]}]}
+      return {data:[]}
+    },
+    complete:async(_,__,input)=>{
+      contexts.push(JSON.stringify(input))
+      const batches=[['execution_plan','declaration_period','queue_rules','export_constraints'],['task_config'],['offer_rules']]
+      const batch=batches[turn++]
+      if(batch)return {completionStatus:'complete',message:{role:'assistant',tool_calls:batch.map(name=>({id:name,type:'function',function:{name,arguments:'{}'}}))}}
+      return {completionStatus:'complete',message:{role:'assistant',content:'执行计划尚未匹配；申报期是否限制报盘需核实客户开关。\n原因分类：任务调度'}}
+    }
+  })
+  assert.ok(requests.some(({path})=>path==='robot/app/client/getRobotPlant/7/m/a?searchText=acc'))
+  assert.ok(requests.some(({path})=>path==='policy/agent/getPolicyAddrDeadlineSettings/9/1'))
+  assert.ok(requests.some(({path,body})=>path==='robot/offerRule/list'&&body.declareWebsite==='site'))
+  assert.ok(contexts.every(text=>!text.includes('FOREIGN_')))
+  assert.ok(contexts.at(-1).includes('declareExpRule=0'))
+  assert.equal(result.category,'任务调度');assert.equal(result.flowConfigurationIssue,false)
+})
+
+test('独立部署政策接口不可用及缺少设备时记录缺口，不跨数据源猜测',async()=>{
+  let turn=0,finalInput;const paths=[]
+  await analyzeTask({appCode:'a',taskCode:'t',accountNumber:'acc',addrId:9,businessType:1},{},{},{
+    request:async(_,path)=>{paths.push(path);if(path.includes('getPolicyAddrDeadlineSettings'))throw Error('HTTP 404');return {data:[]}},
+    complete:async(_,__,input)=>{
+      if(!turn++)return {completionStatus:'complete',message:{role:'assistant',tool_calls:['execution_plan','declaration_period'].map(name=>({id:name,type:'function',function:{name,arguments:'{}'}}))}}
+      finalInput=JSON.stringify(input);return {completionStatus:'complete',message:{role:'assistant',content:'政策接口不可用，无法确定申报期。\n原因分类：证据不足'}}
+    }
+  })
+  assert.match(finalInput,/HTTP 404/);assert.match(finalInput,/缺少客户编号或设备编号/)
+  assert.ok(paths.every(path=>!path.includes('getRobotPlant')))
 })

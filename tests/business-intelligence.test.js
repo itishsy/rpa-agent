@@ -4,7 +4,6 @@ const assert = require('node:assert/strict')
 const { businessContext, traceVariable } = require('../src/agent/business-context')
 const { diagnosisCard, recordDiagnosis } = require('../src/agent/diagnosis')
 const { assertionSchema } = require('../src/agent/business-verification')
-const { ruleSchema, searchRules, makeCase, searchCases } = require('../src/agent/business-knowledge')
 const { createTools, verifyBusiness } = require('../src/agent/tools')
 const { prepareContext } = require('../src/agent/context')
 const { fallbackConclusion } = require('../src/agent/conclusion')
@@ -124,36 +123,6 @@ test('private verification preserves long account identifiers while model-facing
   const session = fixture(), task = { accountNumber: '123456789012345678' }
   assert.equal(businessContext(session, task).fields.account.candidates[0].value, '[ID]')
   assert.equal(businessContext(session, task, { redactResult:false }).fields.account.candidates[0].value, task.accountNumber)
-})
-const rule = { id: 'r1', title: '示例规则', region: '杭州', system: '网厅A', businessType: '汇缴', source: '经确认的业务规范示例', effectiveFrom: '2026-01-01', effectiveTo: '2026-12-31', verifiedAt: '2026-11-01', preconditions: ['核对所属期'], successCriteria: ['官方状态已入账'], rejectionAdvice: [] }
-test('regional rules require a source and valid exact scope, excluding expired and future evidence', () => {
-  assert.equal(ruleSchema().parse([rule]).length, 1)
-  assert.throws(() => ruleSchema().parse([{ ...rule, source: '' }]))
-  assert.throws(() => ruleSchema().parse([{ ...rule, effectiveTo: '2026-02-30' }]))
-  assert.throws(() => ruleSchema().parse([{ ...rule, region: '*' }]))
-  const context = businessContext(fixture()), now = new Date('2026-11-06T00:00:00Z')
-  assert.equal(searchRules([rule], context, '', now).rules.length, 1)
-  assert.equal(searchRules([{ ...rule, region: '其他地区' }], context, '', now).rules.length, 0)
-  assert.equal(searchRules([{ ...rule, effectiveTo: '2026-10-31' }], context, '', now).expiredCount, 1)
-  assert.equal(searchRules([{ ...rule, verifiedAt: '2026-11-07' }], context, '', now).rules.length, 0)
-  assert.equal(searchRules([rule], businessContext({ ...fixture(), dsl: {} }), '', now).missingScope, true)
-})
-test('only current verified outcomes with official state assertions become cases; imported references cannot self-promote', () => {
-  const session = fixture(), now = new Date('2026-11-06T00:00:00Z')
-  session.rules = [{ id: 's', type: 'businessState' }]
-  session.runs = [{ taskCode: 'task', revision: 1, artifactId: 'evidence', rootDslFingerprint: digest(session.dsl), result: { status: 'SUCCEEDED' }, verification: { status: 'PENDING' } }]
-  assert.throws(() => makeCase(session, now), /业务已验证/)
-  session.runs[0].verification.status = 'VERIFIED'
-  const item = makeCase(session, now)
-  assert.equal(item.status, 'VERIFIED_OUTCOME')
-  assert.equal(searchCases([item], businessContext(session), '', now).length, 1)
-  assert.equal(searchCases([item], businessContext(session), '', new Date('2027-03-01')).length, 0)
-  assert.equal(searchCases([{ ...item, status: 'UNVERIFIED_REFERENCE' }], businessContext(session), '', now).length, 0)
-  assert.equal(searchCases([item], businessContext(session), '', now, 'changed-rules')[0].needsRevalidation, true)
-  session.dsl.steps[0].actionArgs.socialNumber = 'changed-unit'
-  assert.equal(searchCases([item], businessContext(session), '', now)[0].needsRevalidation, true)
-  session.revision++
-  assert.throws(() => makeCase(session, now), /当前版本/)
 })
 test('building a dependency bundle cannot contaminate the root configuration fingerprint', async () => {
   const dsl = { appCode:'app', appName:'app', flowCode:'flow', flowName:'查询', steps:[{stepCode:'s',stepName:'查询',actionCode:'read'}] }

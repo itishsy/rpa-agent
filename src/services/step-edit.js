@@ -1,6 +1,6 @@
 'use strict'
 const { randomUUID } = require('node:crypto')
-const { clone } = require('../agent/store')
+const { clone } = require('../agent-core/store')
 
 function importRecordedSteps(current, recorded, { parentStepCode, index } = {}) {
   const dsl = clone(current), incoming = clone(recorded.steps), used = new Set(), warnings = []

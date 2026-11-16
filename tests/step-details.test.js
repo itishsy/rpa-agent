@@ -89,7 +89,8 @@ for (const name of ['run_current_dsl', 'run_proposed_dsl', 'run_selected_step', 
     const { Harness } = require('../src/agent/harness')
     const { digest } = require('../src/agent/store')
     const definitions = h5Definitions(), values = Object.fromEntries(definitions.map(field => [field.fieldKey, 'fixture']))
-    Object.assign(values, { validateType: 'qrCode', inputType: '', inputXpath: 'stale-sms-input', smsXpath: 'stale-sms-button' })
+    Object.assign(values, { validateType: 'qrCode', inputType: '', inputXpath: 'stale-sms-input', smsXpath: 'stale-sms-button',
+      legacyField: 'previous-catalog-value' })
     const dsl = { appCode: 'a', flowCode: 'f', steps: [{ stepCode: 'qr', stepName: 'h5扫码登录', actionCode: 'h5Login', actionArgs: values }] }
     const current = { id: 'qr-session', scope: { appCode: 'a', flowCode: 'f', executor: 'http://fixture' }, dsl,
       taskCode: 'fixture', revision: 0, runs: [], rules: [], messages: [], plan: [], events: [], artifacts: {}, sequence: 0 }
@@ -106,6 +107,7 @@ for (const name of ['run_current_dsl', 'run_proposed_dsl', 'run_selected_step', 
     assert.equal(submitted.steps[0].actionArgs.qrCodeXpath, 'fixture')
     assert.equal(submitted.steps[0].actionArgs.smsXpath, '')
     assert.equal(submitted.steps[0].actionArgs.inputXpath, '')
+    assert.equal(submitted.steps[0].actionArgs.legacyField, 'previous-catalog-value')
     assert.equal(current.dsl.steps[0].actionArgs.smsXpath, 'stale-sms-button')
   })
 }

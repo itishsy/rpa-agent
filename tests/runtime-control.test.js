@@ -1,6 +1,19 @@
 'use strict'
 const test=require('node:test'),assert=require('node:assert/strict')
 const {runtimeUrl,matchTask}=require('../src/services/runtime-control')
+const {normalizeBaseUrl,request,isLocalBaseUrl}=require('../src/services/executor-service')
+const {executorKey}=require('../src/agent-core/control')
+test('executor proxy paths are normalized and kept distinct',()=>{
+ const address='http://localhost:8765/virwin/p/28003'
+ assert.equal(normalizeBaseUrl(address+'/'),address)
+ assert.equal(normalizeBaseUrl('https://executor.example.test/'),'https://executor.example.test')
+ assert.equal(isLocalBaseUrl(address),false)
+ assert.notEqual(executorKey(address),executorKey(address.replace('28003','28004')))
+ assert.throws(()=>request(address,{path:'/api/robot/../../status'}),/越界/)
+ assert.throws(()=>normalizeBaseUrl(address+'?key=test'),/查询参数/)
+ assert.equal(runtimeUrl({baseUrl:address,runtimeUrl:'https://runtime.example.test/agent-proxy/'}),'https://runtime.example.test/agent-proxy')
+ assert.throws(()=>runtimeUrl({baseUrl:address}),/填写对应的 Runtime 地址/)
+})
 test('takeover uses configured runtime and requires a unique task account',()=>{
  assert.equal(runtimeUrl({baseUrl:'http://192.0.2.10:9090'}),'http://192.0.2.10:19090')
  assert.equal(runtimeUrl({baseUrl:'http://192.0.2.10:9090',runtimeUrl:'https://runtime.example.test:19091'}),'https://runtime.example.test:19091')

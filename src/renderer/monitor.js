@@ -149,7 +149,7 @@ function createTaskMonitor(monitorRoot = document) {
             baseServer: item.baseServer,
             appCode: item.appCode,
             appName: item.appName,
-            taskName: detail.name, taskCode: item.taskCode
+            taskName: detail.name, rowId: item.id
           }) } catch (error) { showMessage(error.message.replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,''), 'error') }
           finally{link.removeAttribute('aria-busy')}
         })
@@ -165,15 +165,89 @@ function createTaskMonitor(monitorRoot = document) {
       rows.forEach(item => {
         const row = document.createElement('tr')
         appendCompactCell(row, item.appName,'monitor-app')
-        appendCompactCell(row, item.customerName)
-        appendCompactCell(row, item.accountNumber,'monitor-account')
+        const account = appendCompactCell(row, item.accountNumber, 'monitor-account')
+        account.firstElementChild.classList.add('monitor-account-name')
+        if (item.customerName) {
+          const customer = document.createElement('small')
+          customer.className = 'monitor-cell-text monitor-customer'
+          customer.textContent = item.customerName
+          customer.title = customer.textContent
+          account.append(customer)
+        }
         const status=appendCompactCell(row, formatTaskStatus(item),'monitor-status')
         status.firstElementChild.classList.add('task-status-badge',item.taskStatus==='正在执行'?'running':item.taskStatus==='已停用'?'disabled':item.taskStatus==='已启用'?'enabled':'neutral')
+        const executions=document.createElement('small');executions.className='execution-count'
+        executions.textContent='今日执行：'+(item.execCount===null||item.execCount===undefined||item.execCount===''?'—':String(item.execCount)+' 次')
+        status.append(executions)
         appendTaskDetails(row, item)
-        appendCompactCell(row, item.incompleteReason || '尚未分析','monitor-reason')
         appendCompactCell(row, item.remark,'monitor-remark')
-        appendCell(row, item.execCount, 'execution-count')
-        const actions=document.createElement('td'),takeover=document.createElement('button');actions.className='monitor-actions';takeover.className='button monitor-takeover';takeover.textContent='Agent接管';takeover.onclick=async()=>{takeover.disabled=true;try{await openAgentTakeover(item.id)}catch(error){showMessage(error.message,'error')}finally{takeover.disabled=false}};actions.append(takeover);row.append(actions)
+        const analyzed = !!(item.analyzedAt || item.analysisAttempted)
+        const reason = item.analyzing ? '正在分析…' : item.incompleteReason ? analysisSummary.summarize(item.incompleteReason)
+          : analyzed ? '暂无分析结论' : '未分析'
+        const reasonCell = appendCompactCell(row, reason, 'monitor-reason-cell')
+        reasonCell.firstElementChild.classList.add('monitor-reason')
+        reasonCell.classList.toggle('monitor-reason-pending', !item.incompleteReason || !!item.analyzing)
+        const actions = document.createElement('td')
+        actions.className = 'monitor-actions'
+        const controls = document.createElement('div')
+        controls.className = 'monitor-analysis-controls'
+        actions.append(controls)
+        if (!item.analyzing && !analyzed && !item.incompleteReason) {
+          const analyze=document.createElement('button');analyze.type='button';analyze.className='monitor-analysis-link monitor-analyze-task';analyze.textContent='AI分析'
+          analyze.title='仅分析该任务的未完成原因';analyze.disabled=analyzing||refreshing
+          analyze.onclick=()=>analyzeRows(allRows.filter(row=>row.id===item.id));controls.append(analyze)
+        }
+        if(analyzed){
+          const retry=document.createElement('button');retry.className='monitor-analysis-link';retry.textContent='重新分析';retry.disabled=analyzing||refreshing;retry.onclick=()=>analyzeRows(allRows.filter(row=>row.id===item.id),true);controls.append(retry)
+          const diagnosis=item.analysisResult?.analysis
+          if(diagnosis?.flowConfigurationIssue===true&&diagnosis.state==='completed'&&diagnosis.handoff){
+            const debug=document.createElement('button');debug.type='button';debug.className='monitor-analysis-link';debug.textContent='调试接管'
+            debug.disabled=analyzing||refreshing||!!window.desktop.takeoverBlockReason(item.taskStatus)
+            debug.onclick=async()=>{try{await openAgentTakeover(item.id)}catch(error){showMessage(error.message,'error')}}
+            controls.append(debug)
+          }
+          const evidence=item.analysisResult?.analysis?.details||[]
+          if(item.incompleteReason||evidence.length){
+            const details=document.createElement('details');details.className='monitor-evidence'
+            const summary=document.createElement('summary');summary.textContent='明细';details.append(summary)
+            const full=document.createElement('div');full.className='monitor-analysis-full';full.textContent=item.incompleteReason||'';details.append(full)
+            if(evidence.length){const heading=document.createElement('strong');heading.textContent='举证记录';details.append(heading)}
+            const stages={execution:'执行异常',enqueue:'入队判断',dequeue:'出队状态',authentication:'登录认证',environment:'运行环境'}
+            for(const group of evidence)for(const fact of group.facts){
+              const entry=document.createElement('p')
+              const parts=[stages[fact.stage]||'证据',fact.stepName||fact.stepCode,fact.message||fact.error]
+              if(fact.code==='QUEUED_WAITING')parts.push(fact.waitingMinutesAtObservation==null?'队列待执行，等待时长未知':'队列自生成起已等待 '+fact.waitingMinutesAtObservation+' 分钟')
+              if(fact.code==='PENDING_LOGIN')parts.push('登录中心：待登录')
+              if(fact.code==='UKEY_STATE')parts.push('UKey：'+({1:'可用',2:'已挂载',3:'不可用',4:'未插入'}[fact.status]||'状态未知'))
+              if(fact.code==='EXECUTOR_STATE')parts.push('执行器：'+({1:'就绪',2:'运行中',3:'关闭',4:'机器人异常',5:'客户端异常',6:'升级中',7:'升级失败',8:'离线',9:'闲置'}[fact.status]||'状态未知'))
+              if(fact.machineCode)parts.push('设备 '+fact.machineCode)
+              if(fact.at||fact.startTime||fact.createTime)parts.push(fact.at||fact.startTime||fact.createTime)
+              entry.textContent=parts.filter(Boolean).join(' · ');entry.title=fact.note||'后台记录或状态快照，需结合当前现场核对';details.append(entry)
+            }
+            reasonCell.append(details)
+          }
+        }
+        const takeover=document.createElement('button')
+        takeover.type='button';takeover.className='monitor-analysis-link monitor-takeover';takeover.textContent='Agent接管'
+        const blocked=window.desktop.takeoverBlockReason(item.taskStatus) ||
+          (!item.taskCode||!item.appCode||!item.accountNumber?'缺少申报户标识':'') ||
+          (!item.taskDetails?.some(detail=>Number(detail.count)>0)?'没有可接管的未完成服务项目':'')
+        takeover.disabled=!!blocked||analyzing||refreshing
+        takeover.title=blocked||'停用该申报户的自动任务，并打开对应服务项目'
+        takeover.onclick=async()=>{
+          takeover.disabled=true
+          try{
+            const result=await openAccountTakeover(item)
+            if(!result||disposed)return
+            for(const candidate of allRows){
+              if(candidate.analysisSourceKey===item.analysisSourceKey&&candidate.appCode===item.appCode&&candidate.taskCode===item.taskCode)Object.assign(candidate,result)
+            }
+            renderFilteredRows()
+          }catch(error){showMessage(String(error.message).replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,''),'error')}
+          finally{takeover.disabled=!!blocked||analyzing||refreshing}
+        }
+        controls.append(takeover)
+        row.append(actions)
         elements.tableBody.appendChild(row)
       })
       elements.rowCount.textContent = rows.length.toLocaleString('zh-CN')
@@ -194,6 +268,22 @@ function createTaskMonitor(monitorRoot = document) {
     function renderFilteredRows() {
       renderRows(filterRows(allRows, appliedFilter))
       renderFilterSummary()
+    }
+
+    function filterByName(field, keyword) {
+      if (!['appName', 'customerName'].includes(field) || !keyword.trim()) return
+      appliedFilter = normalizeFilter({
+        ...appliedFilter,
+        rules: [
+          ...appliedFilter.rules.filter(rule => !rule.enabled || !['appName', 'customerName'].includes(rule.field)),
+          { field, operator: 'contains', keyword }
+        ]
+      })
+      setFilterInputs(appliedFilter)
+      saveFilter()
+      renderFilteredRows()
+      elements.filterForm.classList.remove('open')
+      elements.filterButton.setAttribute('aria-expanded', 'false')
     }
 
     function setFilterInputs(filter) {
@@ -232,12 +322,22 @@ function createTaskMonitor(monitorRoot = document) {
       keyword.autocomplete = 'off'
       keyword.placeholder = '输入关键字，多个用逗号分隔'
       keyword.value = rule.keyword || ''
+      const enable = document.createElement('label')
+      enable.className = 'filter-rule-toggle'
+      const checkbox = document.createElement('input')
+      checkbox.type = 'checkbox'
+      checkbox.className = 'filter-enabled'
+      checkbox.checked = rule.enabled !== false
+      const toggleText = document.createElement('span')
+      toggleText.textContent = '启用'
+      checkbox.setAttribute('aria-label', '启用此筛选条件')
+      enable.append(checkbox, toggleText)
       const remove = document.createElement('button')
       remove.type = 'button'
       remove.className = 'button remove-rule'
       remove.textContent = '删除'
       remove.addEventListener('click', () => row.remove())
-      row.append(field, operator, keyword, remove)
+      row.append(field, operator, keyword, enable, remove)
       elements.filterRules.appendChild(row)
     }
 
@@ -245,7 +345,8 @@ function createTaskMonitor(monitorRoot = document) {
       return Array.from(elements.filterRules.querySelectorAll('.filter-rule')).map(row => ({
         field: row.querySelector('.filter-field').value,
         operator: row.querySelector('.filter-operator').value,
-        keyword: row.querySelector('.filter-keyword').value
+        keyword: row.querySelector('.filter-keyword').value,
+        enabled: row.querySelector('.filter-enabled').checked
       }))
     }
 
@@ -295,6 +396,8 @@ function createTaskMonitor(monitorRoot = document) {
       }
       clearTimeout(refreshTimer)
       refreshing = true
+      monitorRoot.getElementById('analyzeButton').disabled=true
+      renderFilteredRows()
       elements.exportButton.disabled = true
       elements.refreshButton.disabled = true
       elements.refreshButton.textContent = '刷新中…'
@@ -335,6 +438,8 @@ function createTaskMonitor(monitorRoot = document) {
         showMessage(String(error?.message||error).replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,''), 'error')
       } finally {
         refreshing = false
+        monitorRoot.getElementById('analyzeButton').disabled=analyzing
+        if(!disposed)renderFilteredRows()
         if(typeof renderOverview==='function')renderOverview()
         elements.exportButton.disabled = exporting || !lastUpdatedAt
         elements.refreshButton.disabled = false
@@ -408,35 +513,31 @@ function createTaskMonitor(monitorRoot = document) {
     })
     elements.settingsButton?.addEventListener('click',openTaskSources)
     elements.addServerButton.addEventListener('click', () => addServerRow())
-    monitorRoot.getElementById('analyzeButton').addEventListener('click', async event => {
-      const button = event.currentTarget
-      if(refreshing || analyzing)return
-      analyzing=true
-      analysisStopped=false
-      const stop=monitorRoot.getElementById('stopAnalysis');stop.hidden=false;stop.disabled=false
-      button.disabled = true
-      elements.refreshButton.disabled = true
-      button.title='正在分析当前筛选范围内的未完成任务'
-      // Context-isolated preload functions return cloned rows. Keep references
-      // to the page's own rows so conclusions actually update the table.
-      const selectedIds=new Set(filterRows(allRows,appliedFilter).map(row=>row.id))
-      const rows = allRows.filter(row=>selectedIds.has(row.id)&&(Number(row.noDeclaredCount)>0||Number(row.auditCount)>0))
+    async function analyzeRows(rows,force=false){
+      if(refreshing||analyzing||disposed)return
+      const button=monitorRoot.getElementById('analyzeButton'),stop=monitorRoot.getElementById('stopAnalysis')
+      analyzing=true;analysisStopped=false;stop.hidden=false;stop.disabled=false;button.disabled=true;elements.refreshButton.disabled=true
       let succeeded=0,failed=0
-      if(!rows.length)button.title='当前筛选范围没有待分析任务'
-
-      try {
-        for (const [index, row] of rows.entries()) {
-          if (disposed || analysisStopped) break
-          if (!(Number(row.noDeclaredCount) > 0 || Number(row.auditCount) > 0)) continue
-          const currentRequestId=crypto.randomUUID()
-          button.textContent = `分析中 ${index + 1}/${rows.length}`
-          try { const result=await ipcRenderer.invoke('monitor:analyze', { id: row.id,snapshotAt:analysisSnapshot,requestId:currentRequestId });if(analysisStopped||disposed)break;row.incompleteReason=result.reason;row.analyzedAt=result.analyzedAt;row.analysisModel=result.modelName;if(result.analysis?.state==='failed')failed++;else succeeded++ }
-          catch (error) { row.incompleteReason = analysisStopped?'分析已停止，尚未形成结论':`分析失败：${String(error.message).replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,'')}`;if(!analysisStopped)failed++ }
-          if(disposed)break
-          if (!disposed) renderFilteredRows()
+      try{
+        if(!rows.length){button.title='当前筛选范围没有尚未分析的任务；已有结论请使用单行重新分析。';return}
+        for(const [index,row] of rows.entries()){
+          if(disposed||analysisStopped)break
+          row.analyzing=true;renderFilteredRows();button.textContent='分析中 '+(index+1)+'/'+rows.length
+          try{
+            const result=await ipcRenderer.invoke('monitor:analyze',{id:row.id,snapshotAt:analysisSnapshot,requestId:crypto.randomUUID(),force})
+            if(disposed||analysisStopped)break
+            Object.assign(row,{incompleteReason:result.reason,analyzedAt:result.analyzedAt,analysisModel:result.modelName,analysisCategory:result.analysis?.category,analysisResult:result,analysisAttempted:true})
+            if(result.analysis?.state==='failed')failed++;else succeeded++
+          }catch(error){if(!analysisStopped&&!disposed){row.incompleteReason='分析失败：'+String(error.message).replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,'');row.analysisAttempted=true;row.analysisResult=null;failed++}}
+          finally{row.analyzing=false;if(!disposed)renderFilteredRows()}
         }
-        if(!disposed&&rows.length)button.title=`${analysisStopped?'分析已停止':'分析结束'}：完成 ${succeeded} 项，失败 ${failed} 项。结果见未完成原因列。`
-      } finally { analyzing=false;stop.hidden=true; button.disabled = false; button.textContent = '分析Agent'; elements.refreshButton.disabled = false }
+        if(!disposed)button.title=(analysisStopped?'分析已停止':'分析结束')+'：完成 '+succeeded+' 项，失败 '+failed+' 项。结果见未完成原因列。'
+      }finally{analyzing=false;stop.hidden=true;button.disabled=false;button.textContent='运维Agent';elements.refreshButton.disabled=false;if(!disposed)renderFilteredRows()}
+    }
+    monitorRoot.getElementById('analyzeButton').addEventListener('click',()=>{
+      const ids=new Set(filterRows(allRows,appliedFilter).map(row=>row.id))
+      const rows=allRows.filter(row=>ids.has(row.id)&&!row.analyzedAt&&!row.analysisAttempted&&(Number(row.noDeclaredCount)>0||Number(row.auditCount)>0))
+      return analyzeRows(rows)
     })
     monitorRoot.getElementById('stopAnalysis').addEventListener('click',async event=>{
       analysisStopped=true;event.currentTarget.disabled=true
@@ -482,6 +583,15 @@ function createTaskMonitor(monitorRoot = document) {
     loadSettings().then(refreshData).catch(error => showMessage(error.message || String(error), 'error'))
   
 
-return {elements,refreshData,exportCurrentTasks,dispose(){disposed=true;if(analyzing)ipcRenderer.invoke('monitor:analysis-stop').catch(()=>{});clearTimeout(refreshTimer);clearInterval(countdownTimer)},get monitoredApplications(){return [...monitoredApplications]},get allRows(){return allRows},get lastUpdatedAt(){return lastUpdatedAt},get refreshing(){return refreshing},get lastRefreshFailed(){return lastRefreshFailed}}
+const unsubscribeAccountStatus = ipcRenderer.on('monitor:account-status', update => {
+  for (const row of allRows) {
+    if (row.analysisSourceKey === update.analysisSourceKey && row.appCode === update.appCode && row.taskCode === update.taskCode) {
+      row.taskStatus = update.taskStatus
+      row.taskComment = update.taskComment
+    }
+  }
+  renderFilteredRows()
+})
+return {elements,refreshData,exportCurrentTasks,filterByName,dispose(){disposed=true;unsubscribeAccountStatus();if(analyzing)ipcRenderer.invoke('monitor:analysis-stop').catch(()=>{});clearTimeout(refreshTimer);clearInterval(countdownTimer)},get monitoredApplications(){return [...monitoredApplications]},get allRows(){return allRows},get lastUpdatedAt(){return lastUpdatedAt},get refreshing(){return refreshing},get lastRefreshFailed(){return lastRefreshFailed}}
 }
 if(document.getElementById("tableBody"))window.taskMonitor=createTaskMonitor()

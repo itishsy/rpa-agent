@@ -12,6 +12,19 @@ const dsl = { appCode: 'app', flowCode: 'flow', flowName: '主流程', steps: [
 const makeSession = () => ({ scope: { appCode: 'app', flowCode: 'flow' }, dsl: clone(dsl), revision: 0, rules: [], runs: [] })
 const fakeHarness = { event() {}, artifact() { return 'artifact' } }
 
+test('subflow reading returns real steps and flow-scoped jump diagnostics without deleting a jump',async()=>{
+  const child={scope:{flowCode:'login'},revision:0,dsl:{flowCode:'login',flowName:'登录',steps:[
+    {stepCode:'check',stepName:'当前申报单位错误?',actionCode:'match',skipTo:'退出浏览器'},
+    {stepCode:'exit',stepName:'退出浏览器',actionCode:'browser'}]}}
+  const tools=createTools({subflow:async()=>child})
+  const context=await tools.get('get_subflow_context').run({flowCode:'login'},{session:makeSession()})
+  assert.equal(context.dsl.steps.length,2);assert.deepEqual(context.jumpDiagnostics,[])
+  child.dsl.steps.pop()
+  const invalid=await tools.get('get_subflow_context').run({flowCode:'login'},{session:makeSession()})
+  assert.equal(invalid.dsl.steps[0].skipTo,'退出浏览器')
+  assert.equal(invalid.jumpDiagnostics[0].flowCode,'login');assert.match(invalid.validationScope,/步骤名/)
+})
+
 test('registry schemas remove execution in generation mode; unknown tools are unavailable', () => {
   const tools = createTools({})
   assert.ok(tools.schemas('develop').some(tool => tool.function.name === 'run_current_dsl'))

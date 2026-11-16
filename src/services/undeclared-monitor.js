@@ -37,6 +37,36 @@ async function fetchClientList(server) {
   return authenticatedRequest(server, 'robot/app/client/list', { keyWord: '', status: [], machineCode: '', clientId: null })
 }
 
+const TAKEOVER_COMMENT = 'Agent接管调试中'
+function takeoverBlockReason(status) {
+  if (/正在执行|执行中|运行中|正在运行|获取中|申报中|处理中/.test(toText(status))) return '运行中的任务不可接管'
+  return ['已启用', '已停用', '未运行', '待执行', '空闲'].includes(toText(status)) ? '' : '暂无法确认任务空闲，刷新后重试'
+}
+function takeoverSource(config, row) {
+  const servers = row.isPayFeeTask
+    ? config.payFeeServers || (config.paymentServers || []).map(server=>({...server,authMode:'payment'}))
+    : config.servers || []
+  const matches = servers.filter(server=>analysisSourceKey(server)===row.analysisSourceKey)
+  if (matches.length !== 1 || !row.appCode || !row.taskCode || !row.accountNumber) throw new Error('缺少可唯一识别的申报户或任务数据源')
+  return matches[0]
+}
+async function readTakeoverAccount(server, row) {
+  const payload = await fetchClientList(server)
+  const matches = findRecordArray(payload,['appCode','taskCode','accountNumber','accNumber']).filter(record=>
+    toText(record.appCode)===row.appCode && toText(record.taskCode)===row.taskCode &&
+    [toText(record.accountNumber),toText(record.accNumber)].includes(row.accountNumber))
+  if(matches.length!==1)throw new Error('申报户已变化或无法唯一匹配，请刷新任务列表')
+  return {taskStatus:toText(matches[0].taskStatus),taskComment:toText(matches[0].taskComment)}
+}
+async function pauseTakeoverAccount(server,row) {
+  await updateTakeoverAccount(server, row, 0, TAKEOVER_COMMENT)
+}
+async function updateTakeoverAccount(server, row, status, comment) {
+  const path = 'robot/app/client/updateTaskStatus/' + [row.appCode, row.taskCode, status].map(encodeURIComponent).join('/')
+  const payload = await authenticatedRequest(server, path + '?comment=' + encodeURIComponent(comment))
+  if (Number(payload?.code) !== 200 || payload.data === false) throw new Error('平台未确认更新申报户状态')
+}
+
 const CUSTOMER_BASE_SERVER = 'https://rpa.internal.nfstone.com'
 
 async function fetchCustomerNames(server) {
@@ -475,6 +505,7 @@ async function platformPaymentServers(platformService) {
 }
 
 module.exports = {
+  TAKEOVER_COMMENT, takeoverBlockReason, takeoverSource, readTakeoverAccount, pauseTakeoverAccount, updateTakeoverAccount,
   analysisSourceKey,
   analysisAccessToken: async server => server.accessToken || await cachedLogin(server).entry.promise,
   authenticatedRequest,

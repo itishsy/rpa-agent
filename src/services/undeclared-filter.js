@@ -12,7 +12,8 @@ function normalizeFilter(filter = {}) {
     .map(rule => ({
       field: rule.field,
       operator: rule.operator === 'notContains' ? 'notContains' : 'contains',
-      keyword: String(rule.keyword || '').trim()
+      keyword: String(rule.keyword || '').trim(),
+      enabled: rule.enabled !== false
     }))
     .filter(rule => splitKeywords(rule.keyword).length)
   return { rules, includePayFee: filter.includePayFee !== false }
@@ -20,7 +21,8 @@ function normalizeFilter(filter = {}) {
 
 function filterRows(rows, filter) {
   const selected = normalizeFilter(filter)
-  return rows.filter(row => selected.rules.every(rule => {
+  const activeRules = selected.rules.filter(rule => rule.enabled)
+  return rows.filter(row => activeRules.every(rule => {
     const value = String(row[rule.field] || '').toLocaleLowerCase()
     const matches = splitKeywords(rule.keyword).some(keyword => value.includes(keyword))
     return rule.operator === 'notContains' ? !matches : matches
@@ -29,7 +31,7 @@ function filterRows(rows, filter) {
 
 function filterLabels(filter) {
   const selected = normalizeFilter(filter)
-  const labels = selected.rules.map(rule =>
+  const labels = selected.rules.filter(rule => rule.enabled).map(rule =>
     `${FIELDS[rule.field]}${rule.operator === 'notContains' ? '不包含' : '包含'}${rule.keyword}`)
   if (!selected.includePayFee) labels.push('不包含缴费任务')
   return labels

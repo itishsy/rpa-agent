@@ -55,6 +55,17 @@ test('application release, offline and state contracts separate JSON body from q
   assert.equal(f.calls[2].params.remark,'网站升级')
   await assert.rejects(f.service.invoke('releaseApplication',{appCode:'app',rule:'补丁',changeReason:'x',comment:'x'.repeat(501)}),/500/)
 })
+test('production sync never follows a failed release or a stale version', async () => {
+  const f = fixture({request:async request=>{
+    if(request.path==='robot/app/page')return {rows:[{appCode:'app',version:'V1.2.3',flowCount:1}]}
+    if(request.path==='robot/app/release')throw new Error('发布失败')
+    assert.fail('不应同步生产')
+  }})
+  const input={appCode:'app',expectedVersion:'V1.2.3',rule:'补丁',changeReason:'流程优化',comment:'更新'}
+  await assert.rejects(f.service.invoke('releaseToProduction',input),/发布失败/)
+  await assert.rejects(f.service.invoke('releaseToProduction',{...input,expectedVersion:'V1.2.2',syncOnly:true}),/版本已变化/)
+  assert.deepEqual(f.calls.map(item=>item.path),['robot/app/page','robot/app/release','robot/app/page'])
+})
 test('flow list retains all requested filter arrays and duplicate names cannot create another flow', async () => {
   const f=fixture()
   await f.service.invoke('flows',{appCode:'app',flowTypeList:[2],serviceItemList:[1],declareSystemList:['sys']})
@@ -70,9 +81,8 @@ test('flow editing sends JSON with the fresh row id; creating/copying/linking us
   assert.equal(f.calls.at(-1).params.flowType,1);assert.equal(f.calls.at(-1).body,undefined)
   await f.service.invoke('saveFlow',{...common,mode:'copyAdd',sourceFlowCode:'source'})
   assert.equal(f.calls.at(-1).params.flowCode,'source');assert.equal(f.calls.at(-1).params.flowType,'')
-  await assert.rejects(f.service.invoke('saveFlow',{...common,mode:'relateAdd',sourceFlowCode:'source'}),/允许范围/)
-  await f.service.invoke('saveFlow',{...common,mode:'relateAdd',sourceFlowCode:'f2'})
-  assert.equal(f.calls.at(-1).path,'robot/flow/relateAdd')
+  await assert.rejects(f.service.invoke('saveFlow',{...common,mode:'relateAdd'}),/添加方式无效/)
+  assert.equal(Object.hasOwn(f.calls.at(-1).params,'templateFlowCode'),false)
 })
 test('flow sorting validates the complete application range and flow status/history use their actual JSON contract', async () => {
   const f=fixture()

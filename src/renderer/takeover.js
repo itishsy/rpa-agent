@@ -1,6 +1,35 @@
 'use strict'
 let takeoverDialog=null
 function fillTakeoverSelect(element,rows,value,label,placeholder){element.replaceChildren(new Option(placeholder,''),...rows.map(row=>new Option(label(row),value(row))))}
+async function openAccountTakeover(row){
+  if(takeoverDialog?.open)return
+  const services=[...new Set(row.taskDetails.filter(detail=>Number(detail.count)>0).map(detail=>detail.name))]
+  const submitTakeover=serviceName=>window.desktop.invoke('monitor:account-takeover',{rowId:row.id,serviceName})
+  if(services.length===1)return submitTakeover(services[0])
+  return new Promise(resolve=>{
+    const dialog=document.createElement('dialog');dialog.className='takeover-dialog';takeoverDialog=dialog
+    const form=document.createElement('form'),title=document.createElement('h2');title.textContent='Agent接管 · '+row.accountNumber
+    const label=document.createElement('label');label.textContent='选择要打开的服务项目'
+    const select=document.createElement('select');select.required=true
+    fillTakeoverSelect(select,services,name=>name,name=>name,'请选择服务项目')
+    label.append(select)
+    const feedback=document.createElement('p');feedback.setAttribute('role','status')
+    const submit=document.createElement('button');submit.className='primary';submit.type='submit';submit.textContent='接管并打开'
+    const cancel=document.createElement('button');cancel.type='button';cancel.textContent='取消';cancel.onclick=()=>dialog.close()
+    form.append(title,label,feedback,submit,cancel);dialog.append(form);document.body.append(dialog)
+    let pending=false,result
+    dialog.addEventListener('cancel',event=>{if(pending)event.preventDefault()})
+    dialog.onclose=()=>{dialog.remove();takeoverDialog=null;resolve(result)}
+    form.onsubmit=async event=>{
+      event.preventDefault();if(pending)return
+      pending=true;submit.disabled=cancel.disabled=select.disabled=true;feedback.textContent='正在接管申报户…'
+      try{result=await submitTakeover(select.value);dialog.close()}
+      catch(error){feedback.textContent=String(error.message).replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,'')}
+      finally{pending=false;submit.disabled=cancel.disabled=select.disabled=false}
+    }
+    dialog.showModal()
+  })
+}
 async function openAgentTakeover(rowId){
   if(takeoverDialog?.open){takeoverDialog.focus();return}
   const options=await window.desktop.invoke('monitor:takeover-options',rowId)

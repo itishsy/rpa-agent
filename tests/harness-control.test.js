@@ -28,6 +28,53 @@ function rpaFixture(extra = {}) {
   return f
 }
 
+test('a debug authentication denial stops the turn with no execution budget or uncertain run', async () => {
+  let executions = 0, modelCalls = 0
+  const denial = Object.assign(new Error('目标执行器拒绝了调试访问'), { code: 'EXECUTOR_DEBUG_AUTH' })
+  const f = rpaFixture({ execute: async () => { executions++; throw denial } })
+  f.harness.complete = async () => {
+    modelCalls++
+    return { role: 'assistant', tool_calls: [modelCall('run_current_dsl', 'debug-' + modelCalls)] }
+  }
+  await assert.rejects(f.harness.start(f.session, '调试当前流程', { executionConsent: true }), { code: 'EXECUTOR_DEBUG_AUTH' })
+  assert.equal(modelCalls, 1)
+  assert.equal(executions, 1)
+  assert.equal(f.session.turn.executions, 0)
+  assert.equal(f.session.state, 'failed')
+  assert.equal(f.session.executionUncertain, undefined)
+  assert.equal(f.harness.leases.quarantines.size, 0)
+  assert.equal(f.harness.leases.owners.size, 0)
+  const { data } = f.events.find(event => event.type === 'execution/completed')
+  assert.match(data.content, /调试未能启动.*拒绝了调试访问/)
+})
+
+test('conversation debugging rejects a model-selected partial scope and sends the applied full DSL', async () => {
+  const submitted = []
+  const f = rpaFixture({
+    bundle: async (_, dsl, options) => { assert.notEqual(options.includeDisabled, true); return dsl },
+    execute: async (_, body) => { submitted.push(body.dsl); return { status: 'SUCCEEDED' } }
+  })
+  f.session.revision = 2
+  f.session.dsl.steps[0].skipTo = '已应用目标'
+  f.session.dsl.steps.push({ stepCode: 'target', stepName: '已应用目标', actionCode: 'page' })
+  let replies = 0
+  f.harness.complete = async ({ tools }) => {
+    assert.ok(tools.some(tool => tool.function.name === 'run_current_dsl'))
+    assert.ok(tools.every(tool => !['run_selected_step', 'run_proposed_dsl', 'continue_failed_run'].includes(tool.function.name)))
+    if (replies++ === 0) return { role: 'assistant', tool_calls: [
+      modelCall('run_selected_step', 'partial', { stepCode: 's' }),
+      modelCall('run_current_dsl', 'full')
+    ] }
+    return { role: 'assistant', content: '执行完成' }
+  }
+  await f.harness.start(f.session, '已应用补丁，请以新 DSL 运行与诊断当前流程', { executionConsent: true })
+  assert.equal(submitted.length, 1)
+  assert.deepEqual(submitted[0].steps, f.session.dsl.steps)
+  assert.equal(f.session.runs[0].executionScope, 'full')
+  assert.equal(f.session.runs[0].revision, 2)
+  assert.match(f.session.messages.find(message => message.tool_call_id === 'partial').content, /EXPLICIT_RUN_SCOPE_REQUIRED/)
+})
+
 test('stop during asynchronous RPA preflight prevents the real run and does not send a premature cancel', async () => {
   const gate = deferred(); let executed = 0, cancels = 0
   const f = rpaFixture({ tasks: async () => { await gate.promise; return [{ taskCode: 'original' }] }, execute: async () => { executed++ } })
@@ -37,6 +84,39 @@ test('stop during asynchronous RPA preflight prevents the real run and does not 
   await assert.rejects(running, /已停止/)
   assert.equal(executed, 0); assert.equal(cancels, 0)
   assert.equal(f.session.executionUncertain, undefined)
+  assert.equal(f.events.find(event => event.type === 'execution/completed').data.status, 'CANCELLED')
+})
+test('DSL debug publishes the executor outcome and failure details without asking the model', async () => {
+  const f = rpaFixture({ execute: async () => ({
+    status: 'FAILED', executionCode: 'failed-run', failedStepCode: 'login',
+    details: [{ stepCode: 'login', stepName: '登录', status: 0, error: '验证码错误' }]
+  }) })
+  const result = await f.harness.start(f.session, 'run', { directTool: { name: 'run_current_dsl' }, executionConsent: true })
+  const [run] = f.session.runs
+  const events = f.events.filter(event => event.type === 'execution/completed')
+  assert.equal(events.length, 1)
+  assert.equal(events[0].data.artifactId, run.artifactId)
+  assert.equal(result.conclusion, run.conclusion.content)
+  assert.match(result.conclusion, /调试失败.*登录.*验证码错误/)
+  assert.equal(f.harness.readArtifact(f.session, run.artifactId).details[0].status, 0)
+  assert.equal(f.session.turn.modelCalls, 0)
+})
+test('a lost DSL response produces an unknown result instead of using an earlier run', async () => {
+  const f = rpaFixture({ execute: async () => { throw new Error('连接执行器超时') } })
+  f.session.runs.push({ result: { status: 'SUCCEEDED' }, artifactId: 'earlier' })
+  await assert.rejects(f.harness.start(f.session, 'run', { directTool: { name: 'run_current_dsl' }, executionConsent: true }), /连接执行器超时/)
+  const { data } = f.events.find(event => event.type === 'execution/completed')
+  assert.equal(data.status, 'UNKNOWN')
+  assert.equal(data.artifactId, undefined)
+  assert.match(data.content, /调试结果待确认.*连接执行器超时/)
+})
+test('step evidence without a final DSL status stays unconfirmed', async () => {
+  const f = rpaFixture({ execute: async () => ({ details: [{ stepName: '登录', status: 1 }] }) })
+  const result = await f.harness.start(f.session, 'run', { directTool: { name: 'run_current_dsl' }, executionConsent: true })
+  assert.equal(result.status, 'UNKNOWN')
+  assert.equal(result.businessVerification.status, 'UNKNOWN')
+  assert.match(result.conclusion, /调试结果待确认.*成功 1 次/)
+  assert.ok(f.session.runs[0].artifactId)
 })
 test('a cancelled asynchronous patch cannot stage a candidate later', async () => {
   const gate = deferred(), controller = new AbortController()
@@ -59,16 +139,19 @@ test('cancel uses the effective override account and holds the lease until cance
   cancel.resolve(); await stopping; await assert.rejects(running, /已停止/)
   assert.equal(f.harness.leases.owners.size, 0)
 })
-test('unknown post-commit results are quarantined across recovery until explicit stopped evidence', async () => {
+test('unknown post-commit results survive recovery without blocking a new manual execution', async () => {
   const gate = deferred()
   const f = setup({ tools: { run: tool('run', 'execute', async () => gate.promise) } })
   const running = f.harness.start(f.session, 'run', { directTool: { name: 'run' }, executionConsent: true })
   await tick()
   const checkpoint = clone(f.writes.find(item => item.turn?.calls.some(call => call.phase === 'submitted')))
-  const restarted = setup({ tools: { run: tool('run', 'execute', async () => assert.fail('must not replay')) } })
+  let executed = 0
+  const restarted = setup({ tools: { run: tool('run', 'execute', async () => { executed++; return { status: 'SUCCESS' } }) } })
   restarted.harness.recover(checkpoint)
   assert.equal(checkpoint.state, 'interrupted')
-  await assert.rejects(restarted.harness.start(checkpoint, 'run', { directTool: { name: 'run' }, executionConsent: true }), /未核对/)
+  assert.equal(executed, 0)
+  await restarted.harness.start(checkpoint, 'run', { directTool: { name: 'run' }, executionConsent: true })
+  assert.equal(executed, 1)
   assert.throws(() => restarted.harness.reconcileExecutor(checkpoint.scope.executor, { executor: 'http://other', status: 'STOPPED' }), /同一执行器/)
   assert.equal(restarted.harness.reconcileExecutor(checkpoint.scope.executor, { executor: checkpoint.scope.executor, status: 'STOPPED' }).reconciled, true)
   assert.equal(checkpoint.executionUncertain, null)
@@ -77,8 +160,12 @@ test('unknown post-commit results are quarantined across recovery until explicit
 })
 test('loopback executor aliases cannot acquire two independent leases', () => {
   const leases = new ExecutorLeases(), release = leases.acquire('http://localhost:9090', 'one')
+  leases.quarantine('http://localhost:9090', 'interrupted')
   assert.throws(() => leases.acquire('http://127.0.0.1:9090/', 'two'), /已有任务/)
   release(); assert.equal(leases.owners.size, 0)
+  const releaseNext = leases.acquire('http://127.0.0.1:9090/', 'two')
+  assert.equal(leases.quarantines.size, 1)
+  releaseNext()
 })
 test('audited reads overlap, writes wait, and tool results preserve model call order', async () => {
   const first = deferred(), second = deferred(), entered = []; let calls = 0

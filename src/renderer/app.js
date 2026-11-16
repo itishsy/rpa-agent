@@ -2,7 +2,55 @@
 const $ = id => document.getElementById(id)
 const invoke = (name, ...args) => window.desktop.invoke(name, ...args)
 const pretty = value => JSON.stringify(value, null, 2)
-let current = null, selected = null, copied = null, flowRows = [], historyRows = [], approvals = null
+let current = null, selected = null, copied = null, flowRows = [], approvals = null
+const attachmentDrafts = new Map(), attachmentUploads = new Map()
+function renderRequestAttachments() {
+  const host=$('requestAttachments'), id=current?.id
+  host.replaceChildren()
+  for(const file of attachmentDrafts.get(id)||[]){
+    const chip=document.createElement('span');chip.className='html-attachment';chip.setAttribute('role','listitem')
+    const label=document.createElement('span');label.textContent=file.name+' · '+Math.max(1,Math.ceil(file.bytes/1024))+' KB';label.title=file.name
+    const remove=document.createElement('button');remove.type='button';remove.textContent='×';remove.setAttribute('aria-label','移除附件 '+file.name)
+    remove.onclick=()=>{attachmentDrafts.set(id,(attachmentDrafts.get(id)||[]).filter(item=>item.artifactId!==file.artifactId));renderRequestAttachments();updateComposerMode()}
+    chip.append(label,remove);host.append(chip)
+  }
+  if(attachmentUploads.get(id)?.size){const pending=document.createElement('span');pending.setAttribute('role','status');pending.textContent='正在添加附件…';host.append(pending)}
+  host.hidden=!host.childElementCount
+}
+function queueAttachment(id,load) {
+  const jobs=attachmentUploads.get(id)||new Set();attachmentUploads.set(id,jobs)
+  const user=window.currentUser?.id
+  const job=load().then(file=>{
+    if(window.currentUser?.id!==user)return file
+    const files=attachmentDrafts.get(id)||[]
+    if(!files.some(item=>item.artifactId===file.artifactId))attachmentDrafts.set(id,[...files,file])
+    return file
+  })
+  jobs.add(job);renderRequestAttachments();updateComposerMode()
+  const finish=()=>{
+    jobs.delete(job)
+    if(!jobs.size)attachmentUploads.delete(id)
+    if(current?.id===id){renderRequestAttachments();updateComposerMode()}
+  }
+  job.then(finish,finish)
+  return job
+}
+function renderComposerModels(names) {
+  const select=$('composerModel'), selectedModel=select.value
+  select.replaceChildren(...(names.length?names.map(name=>new Option(name,name)):[new Option('未配置模型','')]))
+  if(names.includes(selectedModel))select.value=selectedModel
+  select.title=select.value||'请先在系统设置中配置 AI 模型'
+  if(typeof updateComposerMode==='function')updateComposerMode()
+}
+let composerModelRevision=0
+desktop.on('models:changed',names=>{composerModelRevision++;renderComposerModels(names)})
+document.addEventListener('user-authenticated',async()=>{
+  const revision=++composerModelRevision
+  const settings=await invoke('settings:get').catch(()=>null)
+  if(!settings||revision!==composerModelRevision)return
+  renderComposerModels([...new Set([settings.modelName,...(settings.additionalModelNames||[])].filter(Boolean))])
+})
+$('composerModel').onchange=event=>{event.target.title=event.target.value;updateComposerMode()}
 let page = 1, resources = null, connections = [], seenSequence = 0, unsubscribe, captureTimer, snapshotRequest = 0
 const schemaCache = new Map()
 let argumentSchemaSequence=0
@@ -19,16 +67,17 @@ function action(id, work) {
     try { await work() } catch (error) { notice(error.message, true) }
     finally {
       $(id).disabled = false
+      if (['attachFile','send'].includes(id)) updateComposerMode()
       if (id === 'managementNext') $(id).disabled = !managed.hasNext
       if (id === 'managementPrevious') $(id).disabled = managed.page <= 1
-      if (current && ['addStep','pasteStep','commitStep','commitDsl','deleteStep','moveUp','moveDown','saveFlow','recording','captureArgument','imageArgument'].includes(id)) renderWorkspace(true)
+      if (current && ['addStep','pasteStep','commitDsl','deleteStep','moveUp','moveDown','stepSave','confirmStepProperties','recording','captureArgument','imageArgument','applyCandidate','discardCandidate','previewCandidate'].includes(id)) renderWorkspace(true)
     }
   })
 }
 function requireCurrent() { if (!current) throw new Error('请先打开流程'); return current.id }
 function clearWorkspace() {
   if(typeof clearWorkspaceTabs==='function')clearWorkspaceTabs()
-  taskLoadSequence++;taskLoading=false
+  taskLoadSequence++;taskLoading=false;taskLoadError='';updateTaskLoadFeedback('')
   current = null; selected = null; approvals = null; snapshotRequest++
   $('revision').textContent = '未打开'; $('agentState').textContent = 'idle'; $('stepTree').replaceChildren(); $('stepTree').textContent = '请选择流程并打开步骤设置'
   $('dsl').value = '{}'; $('stepName').value = ''; $('actionCode').value = ''
@@ -54,7 +103,7 @@ async function bootstrap() {
   $('version').textContent = 'v' + value.version + ' · Electron'
   selectOptions($('platform'), value.platforms, item => item.id, item => item.name + ' · ' + item.username, '选择服务平台')
   $('platform').value = value.executorPlatformId || ''
-  selectOptions($('executor'), value.executors, item => item, item => item)
+  selectOptions($('executor'), value.executors, item => item, item => value.executorNames?.[item]?value.executorNames[item]+' · '+item:item)
   if (!current && value.activeSessions?.length) {
     const attached = await invoke('workspace:attach', value.activeSessions[0].id)
     const session = attached.session
@@ -76,7 +125,7 @@ async function loadApplications() {
 async function loadFlows() {
   if (!$('application').value) throw new Error('请选择应用')
   flowRows = await invoke('platform:request', { path: 'robot/flow/list', body: { appCode: $('application').value } })
-  selectOptions($('flow'), flowRows, item => item.flowCode, item => (item.relationFlowCode ? '↗ ' : '') + item.flowName, '选择流程')
+  selectOptions($('flow'), flowRows, item => item.flowCode, item => item.flowName, '选择流程')
 }
 function appendMessage(content, kind = '') {
   if (!content) return
@@ -88,7 +137,23 @@ function appendMessage(content, kind = '') {
   $('timeline').append(item)
   while ($('timeline').children.length > 150) $('timeline').firstChild.remove()
   $('timeline').scrollTop = $('timeline').scrollHeight
+  return item
 }
+function appendDebugConclusion(data) {
+  const content = data.content || debugExecutionResult.conclusion(data, data.verification).content
+  const item = appendMessage(content, data.status === 'FAILED' ? 'error' : '')
+  if (!data.artifactId) return item
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.textContent = '查看本次执行明细'
+  button.dataset.debugArtifact = data.artifactId
+  item.append(document.createElement('br'), button)
+  return item
+}
+$('timeline').addEventListener('click', event => {
+  const button = event.target.closest('button[data-debug-artifact]')
+  if (button && current) showDebugExecutionDetails(current.id, button.dataset.debugArtifact).catch(error => notice(error.message, true))
+})
 function visitSteps(steps, callback, path = []) {
   steps.forEach((step, index) => {
     const location = [...path, index]
@@ -119,6 +184,7 @@ function renderProperties() {
   else renderExecutionFields()
   $('actionFields').replaceChildren(); $('targetFields').replaceChildren()
   if (step) loadActionSchemas().catch(error => { $('actionSchema').textContent = error.message })
+  if(typeof updatePropertyNavigation==='function')updatePropertyNavigation()
 }
 function renderExecutionFields() {
   const container=$('executionFields');container.replaceChildren()
@@ -200,12 +266,13 @@ async function loadActionSchemas() {
 }
 function renderWorkspace(preserveInputs = false) {
   if (!current) return
+  renderRequestAttachments()
   $('revision').textContent = 'revision ' + current.revision + (current.readOnly ? ' · 只读' : '')
   $('agentState').textContent = current.state
   const approval = current.pendingApproval
   approvals = approval?.id || null; $('approval').hidden = !approval
   if (approval) $('approvalText').textContent = approval.tool + '\n' + pretty(approval.args) + (approval.execution ? '\n执行范围：\n' + pretty(approval.execution) : '')
-  $('reconcileExecutor').hidden = productionRunning || current.productionRunning || !(current.executionUncertain || current.executorBlocked)
+  $('reconcileExecutor').hidden = productionRunningFor(current) || !(current.executionUncertain || current.executorBlocked)
   if (!preserveInputs) $('dsl').value = pretty(current.dsl)
   $('stepTree').replaceChildren()
   $('stepTree').classList.toggle('empty', !current.dsl.steps.length)
@@ -224,7 +291,7 @@ function renderWorkspace(preserveInputs = false) {
     const filtered=voidedBranches.some(parent=>parent.every((part,index)=>location[index]===part))
     if(!filtered)visibleSteps++
     if(state.modified)labels.push(state.added?'新增':'未保存')
-    if(state.voided)labels.push('已作废')
+    if(state.voided)labels.push('禁用')
     const code = document.createElement('small'); code.textContent = step.actionCode
     button.append(name, code)
     if(labels.length){
@@ -232,7 +299,8 @@ function renderWorkspace(preserveInputs = false) {
       for(const text of labels){const badge=document.createElement('em');badge.textContent=text;badges.append(badge)}
       button.append(badges);button.title+=' · '+labels.join(' · ');button.setAttribute('aria-label',button.title)
     }
-    button.onclick = async () => { if(inputDirty()&&!await invoke('app:confirm-navigation'))return;selectWorkspaceStep(location) }
+    button.onclick=()=>navigateStepRow(location).catch(error=>notice(error.message,true))
+    button.ondblclick=()=>navigateStepRow(location,true).catch(error=>notice(error.message,true))
     const row=document.createElement('div');row.className='step-row'+(location.length>1?' child':'')
     row.classList.toggle('step-filtered-voided',filtered)
     row.classList.toggle('step-modified',state.modified);row.classList.toggle('step-voided',state.voided)
@@ -251,28 +319,29 @@ function renderWorkspace(preserveInputs = false) {
     if(['subFlow','finalFlow'].includes(step.actionCode)){
       const open=document.createElement('button');open.className='step-open-subflow';open.textContent='↗';open.title='打开子流程配置';open.setAttribute('aria-label','打开 '+(step.actionArgs?.flowName||step.stepName)+' 子流程配置')
       open.onclick=()=>openSubflowTab(step.stepCode).catch(error=>notice(error.message,true));actions.append(open)
-      button.ondblclick=open.onclick
     }
     actions.append(settings,copy,remove);row.append(handle,button,actions);$('stepTree').append(row)
     if(typeof attachStepDragging==='function')attachStepDragging(row,step)
   })
   if(stepStates.size&&!visibleSteps){const hint=document.createElement('p');hint.className='voided-steps-empty muted';hint.textContent='暂无启用步骤，取消勾选“隐藏禁用步骤”可查看。';$('stepTree').append(hint)}
   $('candidate').hidden = !current.proposal
-  $('candidateDsl').textContent = current.proposal ? pretty(current.proposal) : ''
+  $('candidateDsl').textContent = current.proposal ? pretty(current.proposal.operations) : ''
+  if(typeof renderPatchCard==='function')renderPatchCard()
   $('plan').replaceChildren()
-  for (const item of current.plan || []) {
+  const showPlan=['running','waiting_approval','stopping'].includes(current.state)&&!hasAgentResult(current.turn?.id)
+  for (const item of showPlan ? current.plan || [] : []) {
     const line = document.createElement('div'); line.textContent = ({ pending: '○ ', in_progress: '◉ ', completed: '✓ ' })[item.status] + item.text
     $('plan').append(line)
   }
-  const blocked = current.readOnly || productionRunning || current.productionRunning || ['running','waiting_approval','stopping'].includes(current.state)
+  const blocked = current.readOnly || productionRunningFor(current) || ['running','waiting_approval','stopping'].includes(current.state)
   $('applyCandidate').disabled=blocked||!!current.proposal?.advisoryOnly
   $('referenceModeHint').hidden=!current.readOnly
-  $('applyCandidate').title=current.readOnly||current.proposal?.advisoryOnly?'引用流程建议仅供审阅或临时调试，不能直接应用':''
-  $('candidate').querySelector('summary').textContent=current.proposal?.advisoryOnly?'建议补丁（引用流程，仅供审阅，可临时运行调试）':'待审核候选补丁'
-  for(const id of ['addStep','pasteStep','commitStep','commitDsl','deleteStep','moveUp','moveDown','saveFlow','recording','captureArgument','imageArgument'])$(id).disabled=blocked
+  $('applyCandidate').title=current.readOnly||current.proposal?.advisoryOnly?'只读流程建议仅供审阅或临时调试，不能直接应用':''
+  $('candidate').querySelector('summary').textContent=current.proposal?.advisoryOnly?'建议补丁（只读流程，仅供审阅，可临时运行调试）':'待审核候选补丁'
+  for(const id of ['addStep','pasteStep','commitDsl','deleteStep','moveUp','moveDown','confirmStepProperties','recording','captureArgument','imageArgument'])$(id).disabled=blocked
   for(const id of ['stepName','actionCode','actionArgs','targetArgs','stepOptions','dsl'])$(id).disabled=blocked
   for(const control of document.querySelectorAll('[data-step-option],[data-argument]'))control.disabled=blocked
-  $('task').disabled=taskLoading||['running','waiting_approval','stopping'].includes(current.state)
+  $('task').disabled=taskLoading||!!taskLoadError||['running','waiting_approval','stopping'].includes(current.state)
   if (!preserveInputs) renderProperties()
   if(typeof updateDesignHeader==='function')updateDesignHeader()
 }
@@ -281,9 +350,9 @@ function stepIdentityRepairNotice(session) {
   const repaired = (session.editorRows || []).flatMap(row => [row, ...(row.list || [])]).filter(row => Object.hasOwn(row, 'sourceStepCode'))
   return repaired.length ? '流程已打开：已为 ' + repaired.length + ' 个重复或缺失编码的步骤分配唯一标识，全部步骤已保留。服务器配置尚未修改。' : ''
 }
-async function openFlow(sessionId) {
+async function openFlow() {
   if(workspaceOpening)return false
-  if(!sessionId&&typeof findWorkspaceTab==='function'){
+  if(typeof findWorkspaceTab==='function'){
     const tab=findWorkspaceTab($('application').value,$('flow').value,$('executor').value)
     if(tab){await switchWorkspaceTab(tab);await refreshWorkspaceTasks();return true}
   }
@@ -291,14 +360,14 @@ async function openFlow(sessionId) {
   $('flowManagementTable').setAttribute('aria-busy','true')
   try{
   if (!$('application').value || !$('flow').value) throw new Error('请选择应用和流程')
-  if (sessionId !== current?.id && typeof rememberWorkspaceTab!=='function' && !await confirmNavigation()) {
+  if (typeof rememberWorkspaceTab!=='function' && !await confirmNavigation()) {
     for(const [id,code,name] of [['application',current.scope.appCode,current.dsl.appName],['flow',current.scope.flowCode,current.dsl.flowName]]){
       if(![...$(id).options].some(option=>option.value===code))$(id).add(new Option(name||code,code))
       $(id).value=code
     }
     return false
   }
-  const data = await invoke('workspace:open', { appCode: $('application').value, flowCode: $('flow').value, executor: $('executor').value, sessionId, deferTasks:true })
+  const data = await invoke('workspace:open', { appCode: $('application').value, flowCode: $('flow').value, executor: $('executor').value, deferTasks:true })
   installWorkspace(data)
   $('workspace').classList.remove('agent-hidden');$('toggleAgent').setAttribute('aria-expanded','true')
   setView('workspace')
@@ -307,21 +376,21 @@ async function openFlow(sessionId) {
   return true
   }finally{workspaceOpening=false;$('flowManagementTable').removeAttribute('aria-busy');if(current)updateDesignHeader()}
 }
-function installWorkspace(data) {
+function installWorkspace(data, parentSessionId) {
   if(typeof rememberWorkspaceTab==='function')rememberWorkspaceTab()
   taskLoadSequence++;taskLoading=false
   snapshotRequest++
   current = data.session; selected = current.dsl.steps.length ? [0] : null; seenSequence = current.sequence
-  historyRows = data.history
   approvals = null; $('approval').hidden = true
   selectOptions($('task'), rowsOf(data.tasks), item => item.taskCode, item => item.taskName || item.accountName || item.username || item.taskCode, '请选择该执行器上的申报账户')
+  taskLoadError=data.taskLoadError||data.tasks?.error||'';updateTaskLoadFeedback(taskLoadError,!!taskLoadError)
   $('task').value = current.taskCode || ''
   selectOptions($('actionCode'), data.commands, item => item.actionCode, item => (item.actionName || item.actionCode) + ' · ' + item.actionCode, '选择指令')
   $('timeline').replaceChildren()
-  for (const message of current.messages) if (['assistant', 'user'].includes(message.role)) appendMessage(message.content, message.role)
+  restoreAgentTimeline(current)
+  if(typeof registerWorkspaceTab==='function')registerWorkspaceTab(data,parentSessionId)
   renderWorkspace()
   if(data.tasksPending)refreshWorkspaceTasks().catch(error=>notice(error.message,true))
-  if(typeof registerWorkspaceTab==='function')registerWorkspaceTab(data)
 }
 async function updateDsl(dsl, selectedCode = selectedStep()?.stepCode) {
   const next = await invoke('workspace:update', requireCurrent(), { dsl })
@@ -348,12 +417,16 @@ async function refreshSnapshot() {
   if (!current) return
   const requestId = ++snapshotRequest, id = current.id
   const next = await invoke('agent:snapshot', id)
-  if (requestId !== snapshotRequest || current?.id !== id) return
+  if (current?.id !== id) return
+  if (requestId !== snapshotRequest) return next
   const preserve = inputDirty() && next.revision === current.revision && pretty(next.dsl) === pretty(current.dsl)
   current = next
   renderWorkspace(preserve)
+  return next
 }
-function showJson(title, value, save, help = '') {
+function showJson(title, value, save, help = '', { scrollList = false } = {}) {
+  const dialog = $('jsonDialog')
+  dialog.classList.toggle('execution-details', scrollList)
   $('dialogTitle').textContent = title; $('dialogHelp').textContent = help
   $('dialogJson').value = pretty(value); $('dialogJson').hidden = false
   $('dialogList').replaceChildren(); $('dialogSave').hidden = !save
@@ -361,7 +434,7 @@ function showJson(title, value, save, help = '') {
     try { await save(JSON.parse($('dialogJson').value)); if ($('dialogTitle').textContent === title) $('jsonDialog').close() }
     catch (error) { $('dialogHelp').textContent = error.message }
   }
-  $('jsonDialog').showModal()
+  dialog.showModal()
 }
 function setView(view) {
   document.querySelectorAll('.view').forEach(item => { item.hidden = item.id !== view })
@@ -380,18 +453,77 @@ window.desktop.on('app:settings', () => setView('settings'))
 unsubscribe = window.desktop.on('agent:event', event => {
   if (!current || event.sessionId !== current.id || event.sequence <= seenSequence) return
   seenSequence = event.sequence
-  if (event.type === 'message/assistant') appendMessage(event.data.content)
+  renderAgentTimelineEvent(event)
+  refreshSnapshot().catch(error => notice(error.message, true))
+})
+const terminalAgentTurns=new Set(['turn/completed','turn/failed','turn/cancelled','turn/budget_exhausted','session/interrupted'])
+function hasAgentResult(turnId) {
+  return turnId && [...$('timeline').querySelectorAll('[data-agent-result]')].some(item=>item.dataset.agentResult===turnId)
+}
+function clearAgentProgress(turnId) {
+  for(const item of $('timeline').querySelectorAll('[data-agent-progress]')){
+    if(item.dataset.agentProgress===turnId)item.remove()
+  }
+  $('plan').replaceChildren()
+}
+function restoreAgentTimeline(session) {
+  const turns=new Map()
+  for(const event of session.events){
+    if(!event.turnId)continue
+    if(!turns.has(event.turnId))turns.set(event.turnId,[])
+    turns.get(event.turnId).push(event)
+  }
+  const requests=session.messages.filter(message=>message.role==='user'&&!message.inputId).slice(-turns.size)
+  if(!turns.size){
+    for(const message of session.messages)if(message.role==='user')appendMessage(message.content,'user')
+  }
+  for(const events of turns.values()){
+    appendMessage(requests.shift()?.content,'user')
+    const terminal=events.find(event=>terminalAgentTurns.has(event.type))
+    const lastAssistant=events.findLast(event=>event.type==='message/assistant')
+    const legacyConclusion=terminal?.type==='turn/completed'&&lastAssistant&&
+      !events.some(event=>event.sequence>lastAssistant.sequence&&event.type==='item/started')?lastAssistant:null
+    for(const event of events){
+      if(!terminal||event===terminal||['execution/completed','input/queued','workspace/generated'].includes(event.type)||
+        event.type==='message/assistant'&&(event.data.finalization||event===legacyConclusion)){
+        renderAgentTimelineEvent(event===legacyConclusion?{...event,data:{...event.data,finalization:true}}:event,true)
+      }
+    }
+  }
+}
+function renderAgentTimelineEvent(event,restoring=false) {
+  const progress=(content,kind)=>{
+    if(hasAgentResult(event.turnId))return
+    const item=appendMessage(content,kind)
+    if(item&&event.turnId)item.dataset.agentProgress=event.turnId
+  }
+  if (event.type === 'message/assistant') {
+    if(event.data.finalization)appendMessage(event.data.content)
+    else progress(event.data.content,'assistant')
+  }
   else if (event.type === 'approval/requested') {
     approvals = event.data.id; $('approval').hidden = false
     $('approvalText').textContent = event.data.tool + '\n' + pretty(event.data.args) + (event.data.execution ? '\n执行范围：\n' + pretty(event.data.execution) : '')
-  } else if (event.type === 'item/started') appendMessage('调用工具：' + event.data.tool + '，' + String(event.data.purpose || '执行请求的工具操作').replace(/\s+/g,' '), 'event-line')
-  else if (event.type === 'item/failed') appendMessage(event.data.tool + '：' + event.data.error, 'error')
-  else if (event.type === 'execution/completed') appendMessage('执行状态：' + event.data.status + '，业务核验：' + event.data.verification.status, 'event-line')
+  } else if (event.type === 'item/started') progress('调用工具：' + event.data.tool + '，' + String(event.data.purpose || '执行请求的工具操作').replace(/\s+/g,' '), 'event-line')
+  else if (event.type === 'item/failed') progress(event.data.tool + '：' + event.data.error, 'error')
+  else if (event.type === 'execution/completed') {
+    clearAgentProgress(event.turnId)
+    const result=appendDebugConclusion(event.data)
+    if(result&&event.turnId)result.dataset.agentResult=event.turnId
+  }
   else if (event.type === 'input/queued') appendMessage(event.data.content, 'user')
-  else if (event.type.startsWith('turn/')) appendMessage(event.type + (event.data.error ? '\n' + event.data.error : ''))
+  else if (event.type === 'workspace/generated') {
+    if(!restoring&&$('hideDisabledSteps')){$('hideDisabledSteps').checked=false;$('stepTree').classList.remove('hide-disabled')}
+    appendMessage('步骤已生成到左侧，请检查后保存。','event-line')
+  }
+  else if (terminalAgentTurns.has(event.type)) {
+    clearAgentProgress(event.turnId)
+    if(event.type==='turn/failed')appendMessage(event.data.error||'本轮执行失败。','error')
+    if(event.type==='turn/cancelled'||event.type==='session/interrupted')appendMessage('本轮已停止。')
+    $('timeline').scrollTop=$('timeline').scrollHeight
+  }
   if (event.type.startsWith('turn/') && event.type !== 'turn/started') { $('approval').hidden = true; approvals = null }
-  refreshSnapshot().catch(error => notice(error.message, true))
-})
+}
 
 action('login', async () => {
   if (!$('platform').value) throw new Error('请先添加并选择平台')
@@ -424,14 +556,28 @@ $('task').onchange = async () => {
   try { current = await invoke('workspace:update', requireCurrent(), { taskCode: $('task').value }); notice('调试账户已绑定当前会话') }
   catch (error) { notice(error.message, true); $('task').value = current?.taskCode || '' }
 }
-action('showDsl', async () => { const details = $('dsl').closest('details'); details.open = !details.open; $('dsl').scrollIntoView({ block: 'nearest' }) })
+action('showDsl', async () => {
+  const id=requireCurrent(),button=$('showDsl');button.disabled=true;button.textContent='加载 DSL…'
+  try{
+    const {dsl,diagnostics}=await invoke('workspace:dsl',id)
+    if(current?.id!==id)throw new Error('当前流程已切换，请在对应流程查看 DSL')
+    const warnings=diagnostics.length
+    window.showJsonViewer('查看 DSL · '+(dsl.flowName||dsl.flowCode),dsl,{diagnostics,help:
+      '当前流程及递归调用的子流程（'+dsl.subflows.length+' 个），仅包含启用步骤。'+
+      (warnings?' 有 '+warnings+' 项加载异常，详情见“加载提示”；此内容不是完整可执行包。':'')})
+  }finally{button.disabled=false;button.textContent='查看 DSL'}
+})
 action('commitDsl', () => updateDsl(JSON.parse($('dsl').value)))
-action('exportDsl', async () => { requireCurrent(); await invoke('clipboard:write', pretty(current.dsl)); notice('DSL 已复制') })
+action('exportDsl', async () => {
+  const { dsl } = await invoke('workspace:dsl', requireCurrent())
+  await invoke('clipboard:write', pretty(dsl))
+  notice('DSL 已复制')
+})
 action('addStep', async () => {
   requireCurrent()
   showStepInsert(null)
 })
-action('commitStep', async () => {
+async function commitSelectedStep() {
   if (!selectedStep()) throw new Error('请选择步骤')
   const dsl = structuredClone(current.dsl)
   const step = atPath(dsl, selected)
@@ -443,7 +589,7 @@ action('commitStep', async () => {
   list[selected[selected.length - 1]] = next
   window.stepStructure.renameReferences(dsl,step.stepCode,step.stepName,next.stepName)
   await updateDsl(dsl)
-})
+}
 action('loadAction',loadActionSchemas)
 for(const name of ['actionArgs','targetArgs'])$(name).addEventListener('input',()=>loadActionSchemas().catch(error=>{$('actionSchema').textContent=error.message}))
 action('recording', async () => {
@@ -535,24 +681,164 @@ action('pasteStep', async () => {
   await updateDsl(preview.dsl,preview.dsl.steps.at(-1).stepCode)
   if(preview.warnings.length)notice(preview.warnings.join('\n'))
 })
-action('saveFlow', async () => {
-  if (inputDirty()) throw new Error('属性或 DSL 尚未更新，请先点击“更新步骤”或“更新 DSL”，避免保存旧内容')
-  current = await invoke('workspace:save', requireCurrent()); renderWorkspace(); notice('配置已保存。业务核验结果仍独立绑定原执行 DSL。')
+let savingFlow = false
+action('confirmStepProperties', async () => {
+  const dialog = $('stepPropertiesDialog')
+  if (!dialog.open || dialog.inert) return
+  if (stepEditingBlocked()) throw new Error('当前流程不可编辑')
+  if ($('dsl').value.trim() !== pretty(current.dsl)) throw new Error('请先更新 DSL，再确认步骤修改')
+  dialog.inert = true
+  try {
+    const changed = inputDirty()
+    if (changed) await commitSelectedStep()
+    dialog.close()
+    if (changed) notice('步骤和 DSL 草稿已更新。点击右上角「保存」提交到平台。')
+  } finally {
+    dialog.inert = false
+  }
 })
+action('stepSave', async () => {
+  if (savingFlow) return
+  const sessionId = requireCurrent()
+  if (stepEditingBlocked()) throw new Error('当前流程不可编辑')
+  if ($('dsl').value.trim() !== pretty(current.dsl)) throw new Error('请先更新 DSL，再保存配置')
+  if (inputDirty()) throw new Error('请先在步骤设置中确认属性修改，再保存到平台')
+  savingFlow = true
+  try {
+    const saved = await invoke('workspace:save', sessionId)
+    if (current?.id !== sessionId) return
+    current = saved
+    renderWorkspace()
+    notice('配置已保存。')
+  } finally {
+    savingFlow = false
+  }
+})
+async function addRequestFiles(id,files){
+  const results=await Promise.allSettled(files.map(file=>queueAttachment(id,async()=>{
+    if(file.size>5*1024*1024)throw new Error(file.name+' 超过5MiB')
+    const data=/\.(png|jpe?g)$/i.test(file.name)?{bytes:new Uint8Array(await file.arrayBuffer())}:{content:await file.text()}
+    return invoke('workspace:attach-file',id,{name:file.name,...data})
+  })))
+  const errors=results.filter(item=>item.status==='rejected')
+  if(current?.id===id&&errors.length)notice(errors.map(item=>item.reason.message).join('\n'),true)
+}
+let attachmentPickerSession
+action('attachFile',()=>{attachmentPickerSession=requireCurrent();$('agentFileInput').click()})
+$('agentFileInput').addEventListener('change',event=>{
+  const files=[...event.target.files],id=attachmentPickerSession
+  attachmentPickerSession=null
+  event.target.value=''
+  if(id&&files.length&&current?.id===id)addRequestFiles(id,files)
+})
+$('request').addEventListener('keydown',event=>{
+  if(!event.isComposing&&event.key==='Enter'&&(event.ctrlKey||event.metaKey)){
+    event.preventDefault()
+    $('send').click()
+  }
+})
+$('request').addEventListener('paste',event=>{
+  if(!current||$('request').disabled)return
+  if($('mode').value==='dslRun')return
+  const id=current.id,files=[...(event.clipboardData?.files||[])]
+  if(files.length){
+    event.preventDefault()
+    addRequestFiles(id,files.map((file,index)=>{
+      if(!/^image\/(png|jpeg)$/.test(file.type)||/\.(png|jpe?g)$/i.test(file.name))return file
+      return new File([file],'剪贴板图片-'+(index+1)+'.'+file.type.split('/')[1],{type:file.type})
+    }))
+    return
+  }
+  const plain=event.clipboardData?.getData('text/plain')||'', rich=event.clipboardData?.getData('text/html')||''
+  const text=plain||rich, split=window.htmlInput.extractHtml(text)
+  if(!split.parts.length)return
+  event.preventDefault()
+  const input=$('request'), original=input.value, start=input.selectionStart, end=input.selectionEnd
+  Promise.all(split.parts.map(content=>queueAttachment(id,()=>invoke('workspace:attach-html',id,{content})))).then(()=>{
+    if(current?.id!==id)return
+    if(input.value===original)input.setRangeText(split.text,start,end,'end')
+    else if(split.text)input.value+='\n'+split.text
+    updateComposerMode()
+    notice('HTML已添加为附件，请填写具体操作要求后发送。')
+  }).catch(error=>{if(current?.id===id&&input.value===original){input.setRangeText(text,start,end,'end');updateComposerMode();notice(error.message,true)}})
+})
+const defaultAgentPrompts = {
+  develop: '请运行当前流程的完整 DSL 并采集执行证据，定位首个有证据支持的异常。若确认存在流程配置问题，请生成候选修复补丁供我审核。',
+  dslRun: '请运行当前流程的完整 DSL（包括引用的子流程），采集并保留执行日志、现场上下文、页面 DOM 和截图。仅返回执行结果和证据，不做诊断、不生成补丁。'
+}
+function confirmDefaultAgentPrompt(mode, request) {
+  const dialog = $('defaultAgentPrompt')
+  $('defaultAgentPromptTitle').textContent = mode === 'dslRun' ? '确认运行当前 DSL' : '确认调试与修复'
+  $('defaultAgentPromptText').textContent = request
+  dialog.returnValue = ''
+  dialog.showModal()
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'send'), { once: true })
+  })
+}
 action('send', async () => {
   const id = requireCurrent()
-  if($('mode').value==='run')return runProductionFlow()
-  const request = $('request').value.trim()
-  if(inputDirty())throw new Error('请先更新当前步骤输入，Agent 才能读取最新配置')
-  if (!request) throw new Error('请填写需求')
-  appendMessage(request, 'user'); $('request').value = ''
-  try { await invoke('agent:start', id, { request, mode: $('mode').value }) }
-  finally { await refreshSnapshot() }
+  if (pendingComposerSends.has(id)) return
+  pendingComposerSends.add(id)
+  try { await sendComposerRequest(id) }
+  finally { pendingComposerSends.delete(id) }
 })
+async function sendComposerRequest(id) {
+  await Promise.all([...(attachmentUploads.get(id)||[])])
+  if(current?.id!==id)throw new Error('当前流程已切换，请在对应流程发送需求')
+  const mode = $('mode').value
+  const rawRequest = $('request').value.trim()
+  const preview = window.htmlInput.extractHtml(rawRequest)
+  const files=attachmentDrafts.get(id)||[]
+  if(inputDirty())throw new Error('请先更新当前步骤输入，Agent 才能读取最新配置')
+  if (mode === 'generate' && !preview.text.trim()) {
+    $('request').focus()
+    throw new Error('请描述需要配置的步骤，再发送需求')
+  }
+  const runOnly = mode === 'dslRun'
+  if (runOnly && (taskLoading || !current.taskCode)) throw new Error('请先选择申报账户，再运行当前 DSL')
+  if (!runOnly && !$('composerModel').value) throw new Error('请先在系统设置中配置 AI 模型')
+  let request = rawRequest
+  if (!preview.text.trim()) {
+    const defaultRequest = defaultAgentPrompts[mode]
+    const taskCode = current.taskCode, revision = current.revision
+    const target = runOnly ? '\n\n流程：'+$('workspaceFlowName').textContent+'\n申报账户：'+($('task').selectedOptions[0]?.value === taskCode ? $('task').selectedOptions[0].textContent : taskCode) : ''
+    if (!await confirmDefaultAgentPrompt(mode, defaultRequest + target)) return
+    if (current?.id !== id || current.taskCode !== taskCode || current.revision !== revision) throw new Error('流程或申报账户已变化，请重新发送')
+    request = runOnly ? defaultRequest : [defaultRequest, rawRequest].filter(Boolean).join('\n\n')
+  }
+  if (runOnly) {
+    appendMessage(request, 'user')
+    await executeAndShowEvidence(id, { mode, request })
+    if (current?.id === id && $('request').value.trim() === rawRequest) $('request').value = ''
+    return
+  }
+  appendMessage((preview.text||defaultAgentPrompts[mode])+(files.length?'\n附件：'+files.map(file=>file.name).join('、'):'')+(preview.parts.length?'\nHTML源码将自动转换为附件。':''), 'user'); $('request').value = ''
+  attachmentDrafts.delete(id);renderRequestAttachments()
+  try { await invoke('agent:start', id, { request, attachmentIds:files.map(file=>file.artifactId), mode,modelName:$('composerModel').value,writeToEditor:false }) }
+  catch(error){
+    const merged=new Map([...files,...(attachmentDrafts.get(id)||[])].map(file=>[file.artifactId,file]))
+    if(current?.id===id){
+      if(!$('request').value)$('request').value=rawRequest
+      attachmentDrafts.set(id,[...merged.values()]);renderRequestAttachments()
+      throw error
+    }
+    const tab = workspaceTabs.get(id)
+    if(tab?.view){
+      if(!tab.view.values.request)tab.view.values.request=rawRequest
+      attachmentDrafts.set(id,[...merged.values()])
+    }
+  }
+  finally { if(current?.id===id) await refreshSnapshot() }
+}
 action('steer', async () => {
-  const id = requireCurrent(), request = $('request').value.trim()
-  if (!request) throw new Error('请填写补充指令')
-  await invoke('agent:steer', id, request, current.turn?.id); $('request').value = ''
+  const id = requireCurrent()
+  await Promise.all([...(attachmentUploads.get(id)||[])])
+  if(current?.id!==id)throw new Error('当前流程已切换')
+  const request = $('request').value.trim(), files=attachmentDrafts.get(id)||[]
+  if (!request&&!files.length) throw new Error('请填写补充指令或添加附件')
+  await invoke('agent:steer', id, request, current.turn?.id,files.map(file=>file.artifactId)); $('request').value = ''
+  attachmentDrafts.delete(id);renderRequestAttachments()
   notice('补充指令已排队，旧的待授权执行已撤销；正在执行的动作需要点击停止才能中断。')
 })
 action('reconcileExecutor', async () => {
@@ -562,8 +848,22 @@ action('reconcileExecutor', async () => {
 async function direct(name, args = {}) {
   const id = requireCurrent()
   if(inputDirty())throw new Error('请先更新当前步骤输入，避免执行旧配置')
-  try { await invoke('agent:start', id, { request: name, mode: 'develop', directTool: { name, args } }) }
-  finally { await refreshSnapshot() }
+  return executeAndShowEvidence(id, { request: name, mode: 'develop', directTool: { name, args } })
+}
+async function executeAndShowEvidence(id, input) {
+  const previousTurnId = current.turn?.id
+  try { await invoke('agent:start', id, input) }
+  finally {
+    if (current?.id === id) {
+      try {
+        const next = await refreshSnapshot()
+        if (next?.turn && next.turn.id !== previousTurnId && !$('jsonDialog').open && !$('executionEvidenceDialog')?.open) {
+          const run = next.runs.find(item => item.turnId === next.turn.id)
+          if (run) await showDebugExecutionDetails(id, run.artifactId)
+        }
+      } catch (error) { notice(error.message, true) }
+    }
+  }
 }
 action('runCurrent', () => direct('run_current_dsl'))
 action('runStep', () => {
@@ -577,67 +877,12 @@ for (const [id, allowed] of [['approve', true], ['reject', false]]) action(id, a
   if (!approvals) throw new Error('执行授权已失效')
   await invoke('agent:approve', requireCurrent(), approvals, allowed); approvals = null; $('approval').hidden = true
 })
-for (const [id, operation] of [['applyCandidate', 'apply'], ['discardCandidate', 'discard']]) action(id, async () => {
-  current = await invoke('workspace:candidate', requireCurrent(), operation); $('flow').value = current.scope.flowCode; renderWorkspace()
+action('applyCandidate',()=>showPatchReview())
+action('discardCandidate',async()=>{
+  if(inputDirty())throw new Error('请先更新当前步骤输入，再放弃补丁')
+  current=await invoke('workspace:candidate',requireCurrent(),'discard');renderWorkspace();notice('已放弃本次补丁，步骤未修改。')
 })
-action('assertions', async () => {
-  requireCurrent()
-  showJson('业务成功断言', current.rules, async rules => { current = await invoke('workspace:assertions', current.id, rules) },
-    '支持 textEquals 精确核对单位/所属期、numberEquals 核对人数金额；用 businessField 标明 account、period、personCount、amount。缴费须覆盖这些字段及官方结果。businessState 填 selector、acceptedValues（办结）、pendingValues（待处理）、failedValues（失败）。逐人对账用 recordSet：selector 为人员行，keySelector/valueSelector 为行内唯一标识/状态，records 为 [{"key":"人员标识","value":"预期状态"}]。仅核验新鲜完整的最终页面；表格应展示完整目标批次。')
-})
-action('history', async () => {
-  requireCurrent()
-  showJson('会话归档', { id: current.id, events: current.events }, null, '恢复仅加载记录，不恢复浏览器，也不会自动续跑。')
-  for (const item of historyRows) {
-    const button = document.createElement('button'); button.textContent = item.title + ' · ' + item.state
-    button.onclick = async () => { $('jsonDialog').close(); try { await openFlow(item.id) } catch (error) { notice(error.message, true) } }
-    $('dialogList').append(button)
-  }
-})
-action('evidence', async () => {
-  requireCurrent(); showJson('最近五次执行证据', current.runs, null, 'UNKNOWN 表示待核；技术成功不能替代业务断言。DOM 与 ctx 保存在加密会话中。')
-  for (const run of current.runs) {
-    const button = document.createElement('button'); button.textContent = run.result.executionCode || run.at
-    button.onclick = async () => {
-      try {
-        const result = await invoke('agent:artifact', current.id, run.artifactId)
-        $('dialogJson').value = pretty(result)
-      } catch (error) { $('dialogHelp').textContent = error.message }
-    }
-    $('dialogList').append(button)
-  }
-})
-action('flowGraph', async () => {
-  requireCurrent()
-  showJson('流程图 · ' + (current.dsl.flowName || current.scope.flowCode), {}, null, '实线表示执行顺序；蓝色、红色与橙色线分别表示成功跳转、失败跳转和条件为假跳转。点击节点返回步骤属性。')
-  $('dialogJson').hidden = true
-  const nodes = []; visitSteps(current.dsl.steps, (step, location) => nodes.push({ step, location }))
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
-  svg.setAttribute('viewBox', `0 0 780 ${Math.max(200, nodes.length * 95 + 50)}`)
-  svg.setAttribute('width', '100%'); svg.setAttribute('aria-label', '流程图')
-  const make = (tag, attrs, text) => {
-    const element = document.createElementNS('http://www.w3.org/2000/svg', tag)
-    for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, value)
-    if (text) element.textContent = text
-    return element
-  }
-  nodes.forEach((node, index) => {
-    const y = index * 95 + 20, x = node.location.length > 1 ? 290 : 200
-    if (index) svg.append(make('path', { d: `M 375 ${y - 30} L 375 ${y}`, stroke: '#aab6cc', fill: 'none' }))
-    for (const [field, color, offset] of [['skipTo', '#4264ed', 0], ['failedSkipTo', '#cf5369', 28], ['falseSkipTo', '#d39c36', 56]]) {
-      const target = nodes.findIndex(item => item.step.stepName === node.step[field])
-      if (target >= 0) svg.append(make('path', { d: `M ${x + 300} ${y + 25} H ${650 + offset} V ${target * 95 + 45} H 590`, stroke: color, fill: 'none', 'stroke-width': '2' }))
-    }
-    const group = make('g', { tabindex: '0', role: 'button', 'aria-label': node.step.stepName })
-    group.append(make('rect', { x, y, width: 300, height: 58, rx: 8, fill: Number(node.step.status) === 0 ? '#f0f1f5' : '#edf1ff', stroke: '#ccd5ef' }),
-      make('text', { x: x + 15, y: y + 24, fill: '#233044', 'font-size': '13' }, node.step.stepName.slice(0, 26)),
-      make('text', { x: x + 15, y: y + 44, fill: '#7b8495', 'font-size': '10' }, node.step.actionCode))
-    const navigate = () => { selected = node.location; $('jsonDialog').close(); renderWorkspace() }
-    group.onclick = navigate; group.onkeydown = event => { if (event.key === 'Enter') navigate() }
-    svg.append(group)
-  })
-  $('dialogList').append(svg)
-})
+action('evidence', () => showDebugExecutionDetails(requireCurrent(), null, 'dsl'))
 action('mcp', async () => {
   const value = await invoke('mcp:control', requireCurrent(), true)
   showJson('MCP 连接', { mcpServers: { 'rpa-agent': { url: value.url, http_headers: { Authorization: 'Bearer ' + value.bearerToken } } } }, null,
@@ -646,28 +891,25 @@ action('mcp', async () => {
   button.onclick = async () => { await invoke('mcp:control', current.id, false); $('jsonDialog').close() }
   $('dialogList').append(button)
 })
-action('importExperience', async () => { const value = await invoke('experience:import'); if (value) notice('已导入 ' + value.flowCount + ' 个只读参考流程') })
-action('exportExperience', async () => { const value = await invoke('experience:export'); if (value) notice('已导出 ' + value.flowCount + ' 个参考流程') })
-action('collectExperience', async () => { const result = await invoke('experience:collect'); notice('经验读取完成：' + result.status + '，' + result.flowCount + ' 个流程，' + result.errors.length + ' 项错误') })
-action('stopExperience', async () => { await invoke('experience:stop'); notice('已请求停止经验读取，旧目录保留') })
-window.desktop.on('experience:progress', value => notice('经验读取进度：' + pretty(value)))
-
 function renderConnections() {
   $('connections').replaceChildren()
   connections.forEach((item, index) => {
     const row = document.createElement('div'); row.className = 'connection-row'
-    const url = document.createElement('input'); url.placeholder = 'http://192.168.1.10:9090'; url.value = item.baseUrl
+    const url = document.createElement('input'); url.placeholder = '执行器地址（可含代理路径）'; url.value = item.baseUrl
     url.oninput = () => { item.baseUrl = url.value }
     const token = document.createElement('input'); token.type = 'password'; token.autocomplete = 'off'; token.placeholder = item.hasDebugToken ? '令牌已保存，留空保留' : '调试令牌'
     token.oninput = () => { item.debugToken = token.value }
     const runtime=document.createElement('input');runtime.placeholder='Runtime 地址（默认同主机 :19090）';runtime.value=item.runtimeUrl||'';runtime.oninput=()=>{item.runtimeUrl=runtime.value}
     const remove = document.createElement('button'); remove.textContent = '移除'; remove.onclick = () => { connections.splice(index, 1); renderConnections() }
-    row.append(url,runtime, token, remove); $('connections').append(row)
+    const name=document.createElement('input');name.placeholder='服务名称（如万科）';name.setAttribute('aria-label','后台服务名称');name.maxLength=80;name.value=item.serviceName||''
+    name.oninput=()=>{item.serviceName=name.value}
+    row.append(name,url,runtime,token,remove); $('connections').append(row)
   })
 }
 async function loadSettings() {
   const value = await invoke('settings:get')
   for (const field of ['modelBaseUrl', 'modelName']) $(field).value = value[field]
+  $('additionalModelNames').value=(value.additionalModelNames||[]).join('\n')
   $('modelApiKey').value = ''; $('localDebugToken').value = ''; $('clearModelApiKey').checked = false
   $('modelApiKey').placeholder = value.hasModelApiKey ? '密钥已保存，留空保留' : 'API Key'
   $('localDebugToken').placeholder = value.hasLocalDebugToken ? '令牌已保存，留空保留' : '执行器调试令牌'
@@ -678,7 +920,7 @@ action('saveSettings', async () => {
   if (!await confirmNavigation()) return
   const saved = await invoke('settings:get')
   await invoke('settings:save', { ...saved, modelBaseUrl: $('modelBaseUrl').value, modelName: $('modelName').value, modelApiKey: $('modelApiKey').value,
-    clearModelApiKey: $('clearModelApiKey').checked })
+    additionalModelNames:$('additionalModelNames').value.split(/\r?\n/).map(name=>name.trim()).filter(Boolean), clearModelApiKey: $('clearModelApiKey').checked })
   clearWorkspace(); await bootstrap(); await loadSettings(); notice('设置已保存，请重新打开流程。')
 })
 action('saveExecutorSettings', async () => {

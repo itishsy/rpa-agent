@@ -5,10 +5,85 @@ const { buildDebugDsl, nestDebugSteps, loadReferencedDebugFlows, assertCompleteD
 const step = (name = 'read') => ({ stepCode: name, stepName: name, actionCode: 'read' })
 const call = name => ({ stepCode: 'call-' + name, stepName: '调用' + name, actionCode: 'subFlow', actionArgs: { flowName: name } })
 const root = (steps = [call('医疗增员单个')]) => ({ appCode: 'app', appName: '应用', flowCode: 'main', flowName: '主流程', steps })
+
+test('a login with private steps and template metadata stays visible without querying the template owner',async()=>{
+  const flows=[{flowCode:'main',flowName:'在册主流程新'},{flowCode:'login',flowName:'登录',templateFlowCode:'unavailable-template'},
+    {flowCode:'refresh',flowName:'刷新'}]
+  const calls=[]
+  const bundle=await loadReferencedDebugFlows(root([call('登录')]),'app',api(flows,{
+    getFlow:async code=>{calls.push(code);throw new Error('模板不可用')},
+    listSteps:async flow=>flow.flowCode==='login'?[call('刷新')]:[step('已打开浏览器')]
+  }),{inspect:true})
+  assert.deepEqual(bundle.subflows.map(flow=>flow.flowName),['登录','刷新'])
+  assert.deepEqual(bundle.inspectionDiagnostics,[]);assert.deepEqual(calls,[])
+})
+
+test('DSL viewing omits disabled calls and still reports missing enabled dependencies',async()=>{
+  const flows=[{flowCode:'main',flowName:'主流程'},{flowCode:'a',flowName:'登录'},{flowCode:'b',flowName:'刷新'},{flowCode:'c',flowName:'校验'}]
+  const input=root([call('登录'), {...call('刷新'),status:0},
+    {...step('block'),actionCode:'codeBlock',status:0,body:[call('块内调用')]},call('缺失流程'),
+    {...step('no-name'),actionCode:'subFlow',status:0}])
+  const original=structuredClone(input)
+  const bundle=await loadReferencedDebugFlows(structuredClone(input),'app',api(flows,{
+    listSteps:async flow=>flow.flowCode==='a'?[call('校验')]:[{...step(flow.flowCode),skipTo:'无效跳转'}],
+    prepareFlow:async()=>{throw new Error('只读查看不应编译可执行包')}
+  }),{inspect:true})
+  assert.deepEqual(bundle.subflows.map(flow=>flow.flowCode).sort(),['a','c'])
+  assert.ok(bundle.inspectionDiagnostics.some(item=>item.flowName==='缺失流程'))
+  assert.equal(bundle.inspectionDiagnostics.length,1)
+  assert.deepEqual(bundle.steps,original.steps.filter(item=>item.status!==0))
+})
+
+test('reading login preserves its existing jump target without validating a broken called refresh flow',async()=>{
+  const flows=[{flowCode:'main',flowName:'主流程'},{flowCode:'login',flowName:'登录'},{flowCode:'refresh',flowName:'刷新进入首页'}]
+  const rows={login:[call('刷新进入首页'),{...step('check'),stepName:'当前申报单位错误?',skipTo:'退出浏览器'},
+    {...step('exit'),stepName:'退出浏览器'}],refresh:[{...step('refresh-check'),stepName:'当前申报单位错误?',skipTo:'退出浏览器'}]}
+  const reads=[],source=api(flows,{listSteps:async flow=>{reads.push(flow.flowCode);return rows[flow.flowCode]},
+    prepareFlow:async definition=>{require('../src/shared/step-structure').cleanJumps(definition,true);return definition}})
+  const inspected=await loadReferencedDebugFlows(root([call('登录')]),'app',source,{inspect:true,targetFlowCode:'login'})
+  const login=inspected.subflows.find(flow=>flow.flowCode==='login')
+  assert.equal(login.steps[1].skipTo,'退出浏览器');assert.ok(login.steps.some(step=>step.stepName==='退出浏览器'))
+  assert.deepEqual(require('../src/shared/step-structure').jumpDiagnostics(login),[])
+  assert.deepEqual(reads,['login'])
+  await assert.rejects(loadReferencedDebugFlows(root([call('登录')]),'app',source),/流程“刷新进入首页”.*跳转目标不存在/)
+  const refreshed=await loadReferencedDebugFlows(root([call('登录')]),'app',source,{inspect:true,targetFlowCode:'refresh'})
+  const diagnostics=require('../src/shared/step-structure').jumpDiagnostics(refreshed.subflows.find(flow=>flow.flowCode==='refresh'))
+  assert.equal(diagnostics[0].flowCode,'refresh');assert.equal(diagnostics[0].target,'退出浏览器')
+})
+
+test('inspection tolerates unrelated missing branches without granting access to an uncalled flow',async()=>{
+  const flows=[{flowCode:'main',flowName:'主流程'},{flowCode:'login',flowName:'登录'},{flowCode:'uncalled',flowName:'未调用'}]
+  const data=api(flows,{listSteps:async()=>[step()]})
+  const inspected=await loadReferencedDebugFlows(root([call('不存在'),call('登录')]),'app',data,{inspect:true,targetFlowCode:'login'})
+  assert.ok(inspected.subflows.some(flow=>flow.flowCode==='login'))
+  const uncalled=await loadReferencedDebugFlows(root([call('不存在'),call('登录')]),'app',data,{inspect:true,targetFlowCode:'uncalled'})
+  assert.ok(!uncalled.subflows.some(flow=>flow.flowCode==='uncalled'))
+  assert.equal(uncalled.inspectionDiagnostics[0].flowName,'不存在')
+})
 function api(flows = [{ appCode: 'app', flowCode: 'main', flowName: '主流程' }], extra = {}) {
   return { listFlows: async () => flows, getFlow: async code => flows.find(flow => flow.flowCode === code),
     listSteps: async () => [step()], ...extra }
 }
+
+test('execution omits disabled rows, promotes ordinary children and preserves valid jump targets', async () => {
+  const steps = [{ ...step('check'), skipTo: 'finish' }, {
+    ...call('停用调用'), status: 0, skipTo: '已删除步骤', children: [call('末级')]
+  }, {
+    ...step('block'), actionCode: 'codeBlock', status: 0, body: [{ ...call('停用块调用'), falseSkipTo: '已删除块内步骤' }]
+  }, step('finish')]
+  const flows = [{ flowCode: 'leaf', flowName: '末级' }]
+  const source = api(flows, { listSteps: async () => [step('leaf-step'), { ...call('缺失'), status: '0' }] })
+  const bundle = await loadReferencedDebugFlows(root(steps), 'app', source)
+  assert.equal(bundle.steps[0].skipTo, 'finish')
+  assert.deepEqual(bundle.steps.map(item => item.stepCode), ['check', 'call-末级', 'finish'])
+  assert.deepEqual(bundle.subflows.map(flow => flow.flowName), ['末级'])
+  assert.deepEqual(bundle.subflows[0].steps.map(item => item.stepCode), ['leaf-step'])
+  assert.equal(steps[1].skipTo, '已删除步骤')
+  await assert.rejects(loadReferencedDebugFlows(root(steps), 'app', api([])), /主流程 → 末级/)
+  await assert.rejects(loadReferencedDebugFlows(root([{ ...step('check'), skipTo: 'finish' },
+    { ...step('finish'), status: 0 }]), 'app', source), /跳转目标不存在：finish/)
+  assert.throws(() => buildDebugDsl('app', 'main', root(), steps, steps[0]), /跳转超出单步范围/)
+})
 
 test('partial parameter VOS overlay raw JSON without losing values or treating false string flags as hidden', () => {
   const source = { ...step(), actionArgs: '{"flowName":"医疗增员单个","retained":0,"enabled":false,"masked":"old"}',
@@ -26,7 +101,7 @@ test('DSL conversion preserves execution strategies, both argument maps, app met
   const dsl = buildDebugDsl('app', 'main', metadata, [row, { ...step('block'), actionCode: 'codeBlock', list: [step('inner')] }])
   assert.deepEqual(dsl.steps[0], row)
   assert.equal(dsl.steps[1].body[0].stepCode, 'inner')
-  for (const field of ['appArgs', 'declareSystem', 'serviceItem', 'tagCode', 'runSupport', 'sessionKeep', 'templateFlowCode', 'loginFlowFlag', 'relationFlowCode']) {
+  for (const field of ['appArgs', 'declareSystem', 'serviceItem', 'tagCode', 'runSupport', 'sessionKeep']) {
     assert.deepEqual(dsl[field], metadata[field])
   }
 })
@@ -79,14 +154,10 @@ test('missing native codes are stable and repeated database ids are not reused f
   assert.throws(() => buildDebugDsl('app', 'main', root(), [step(), step()]), /重复/)
 })
 
-test('missing application subflows fall back to public templates and recursively include finalFlow dependencies', async () => {
-  const templates = [{ flowCode: 'template-child', flowName: '医疗增员单个' }, { flowCode: 'cleanup', flowName: '收尾' }]
-  const bundle = await loadReferencedDebugFlows(root(), 'app', api(undefined, {
-    listTemplates: async () => templates,
-    listSteps: async flow => flow.flowCode === 'template-child' ? [{ ...call('收尾'), actionCode: 'finalFlow' }] : [step()]
-  }))
-  assert.deepEqual(bundle.subflows.map(flow => flow.flowCode), ['template-child', 'cleanup'])
-  assert.doesNotThrow(() => assertCompleteDebugDsl(bundle))
+test('current-application subflows recursively include finalFlow dependencies',async()=>{
+ const flows=[{flowCode:'child',flowName:'医疗增员单个'},{flowCode:'cleanup',flowName:'收尾'}]
+ const bundle=await loadReferencedDebugFlows(root(),'app',api(flows,{listSteps:async f=>f.flowCode==='child'?[{...call('收尾'),actionCode:'finalFlow'}]:[step()]}))
+ assert.deepEqual(bundle.subflows.map(f=>f.flowCode),['child','cleanup'])
 })
 
 test('a draft is applied before scanning its new dependency graph, including drafts with no saved steps', async () => {
@@ -98,40 +169,26 @@ test('a draft is applied before scanning its new dependency graph, including dra
   assert.deepEqual(bundle.subflows.map(flow => flow.flowCode), ['child', 'grandchild'])
 })
 
-test('template-backed aliases retain their called name and load their effective template steps', async () => {
-  const flows = [{ flowCode: 'main', flowName: '主流程' }, { flowCode: 'alias', flowName: '别名', templateFlowCode: 'template' }]
-  const requests = []
-  const bundle = await loadReferencedDebugFlows(root([call('别名')]), 'app', api(flows, {
-    getFlow: async code => ({ flowCode: code, flowName: '模板原名', appCode: null }),
-    listSteps: async flow => { requests.push(flow.templateFlowCode || flow.flowCode); return flow.flowCode === 'alias' ? [] : [step()] }
-  }))
-  assert.equal(bundle.subflows[0].flowName, '别名')
-  assert.equal(bundle.subflows[0].steps.length, 1)
-  assert.ok(requests.includes('template'))
+test('legacy template links cannot supply missing current-application steps',async()=>{
+ let retiredReads=0
+ await assert.rejects(loadReferencedDebugFlows(root(),'app',api([{flowCode:'local',flowName:'医疗增员单个',templateFlowCode:'old'}],{
+ listSteps:async()=>[],getFlow:async()=>{retiredReads++},listTemplates:async()=>{retiredReads++}
+ })),/步骤/)
+ assert.equal(retiredReads,0)
 })
 
-test('an empty application child inherits a same-name public template while keeping its alias code', async () => {
-  const flows = [{ flowCode: 'main', flowName: '主流程' }, { flowCode: 'local', flowName: '医疗增员单个' }]
-  const bundle = await loadReferencedDebugFlows(root(), 'app', api(flows, {
-    listTemplates: async () => [{ flowCode: 'public', flowName: '医疗增员单个' }],
-    listSteps: async flow => flow.flowCode === 'local' ? [] : [step()]
-  }))
-  assert.equal(bundle.subflows[0].flowCode, 'local')
-  assert.equal(bundle.subflows[0].steps[0].stepCode, 'read')
+test('missing local calls never fall back to public catalogs',async()=>{
+ let retiredReads=0
+ await assert.rejects(loadReferencedDebugFlows(root(),'app',api([],{listTemplates:async()=>{retiredReads++;return [{flowCode:'old',flowName:'医疗增员单个'}]}})),/未找到当前应用/)
+ assert.equal(retiredReads,0)
 })
 
-test('same-name child references from different applications cannot silently reuse the wrong definition', async () => {
-  const local = [{ flowCode: 'main', flowName: '主流程' }, { flowCode: 'a', flowName: 'A', relationFlowCode: 'source-a' },
-    { flowCode: 'b', flowName: 'B', relationFlowCode: 'source-b' }]
-  const sourceFlows = {
-    'source-a': { flowCode: 'source-a', flowName: '来源A', appCode: 'one' },
-    'source-b': { flowCode: 'source-b', flowName: '来源B', appCode: 'two' }
-  }
-  await assert.rejects(loadReferencedDebugFlows(root([call('A'), call('B')]), 'app', api(local, {
-    getFlow: async code => sourceFlows[code],
-    listFlows: async code => code === 'app' ? local : [{ flowCode: code + '-child', flowName: '同名子流程' }],
-    listSteps: async flow => ['a', 'b'].includes(flow.flowCode) ? [call('同名子流程')] : [step()]
-  })), /同名.*冲突/)
+test('legacy cross-application links do not change call ownership',async()=>{
+ const looked=[]
+ await assert.rejects(loadReferencedDebugFlows(root(),'app',api([{flowCode:'main',flowName:'主流程',relationFlowCode:'other'}],{
+ listFlows:async code=>{looked.push(code);return []},getFlow:async()=>{throw new Error('不可读取旧引用')}
+ })),/未找到当前应用/)
+ assert.deepEqual(looked,['app'])
 })
 
 test('disabled calls are omitted from the closure, while enabled ordinary children and code blocks remain complete', async () => {
@@ -144,14 +201,10 @@ test('disabled calls are omitted from the closure, while enabled ordinary childr
   assert.deepEqual(bundle.subflows.map(flow => flow.flowCode), ['child', 'body'])
 })
 
-test('inherited root metadata locates child flows in the referenced application', async () => {
-  const local = [{ flowCode: 'main', flowName: '主流程', relationFlowCode: 'source-main' }]
-  const remote = [{ appCode: 'source', flowCode: 'source-main', flowName: '来源主流程' }, { appCode: 'source', flowCode: 'source-child', flowName: '医疗增员单个' }]
-  const bundle = await loadReferencedDebugFlows(root(), 'app', api(local, {
-    listFlows: async code => code === 'app' ? local : remote,
-    getFlow: async code => remote.find(flow => flow.flowCode === code)
-  }))
-  assert.equal(bundle.subflows[0].flowCode, 'source-child')
+test('retired root parameters are excluded from loaded DSL',async()=>{
+ const input={...root([step()]),templateFlowCode:'old',relationFlowCode:'source',loginFlowFlag:1,flowGraph:{nodes:[]}}
+ const result=await loadReferencedDebugFlows(input,'app',api())
+ for(const key of ['templateFlowCode','relationFlowCode','loginFlowFlag','flowGraph'])assert.equal(Object.hasOwn(result,key),false)
 })
 
 test('ambiguous application and template names are rejected instead of selecting the first match', async () => {
@@ -160,7 +213,7 @@ test('ambiguous application and template names are rejected instead of selecting
   ])), /同名|不唯一/)
   await assert.rejects(loadReferencedDebugFlows(root(), 'app', api(undefined, {
     listTemplates: async () => [{ flowCode: 'one', flowName: '医疗增员单个' }, { flowCode: 'two', flowName: '医疗增员单个' }]
-  })), /同名|不唯一/)
+  })), /未找到当前应用/)
 })
 
 test('an incomplete bundle and dangling jumps fail integrity checks, while NEXT remains valid', () => {
@@ -173,6 +226,6 @@ test('an incomplete bundle and dangling jumps fail integrity checks, while NEXT 
 
 test('reference cycles stop loading and malformed steps fail instead of masquerading as an empty alias', async () => {
   const flows = [{ flowCode: 'main', flowName: '主流程' }, { flowCode: 'alias', flowName: '医疗增员单个', relationFlowCode: 'alias' }]
-  await assert.rejects(loadReferencedDebugFlows(root(), 'app', api(flows, { listSteps: async () => [] })), /循环/)
+  await assert.rejects(loadReferencedDebugFlows(root(), 'app', api(flows, { listSteps: async () => [] })), /步骤/)
   await assert.rejects(loadReferencedDebugFlows(root(), 'app', api(flows, { listSteps: async () => ({ rows: [] }) })), /步骤.*数组|步骤.*格式/)
 })

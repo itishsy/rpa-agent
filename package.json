@@ -1,6 +1,6 @@
 {
   "name": "rpa-agent",
-  "version": "1.0.4",
+  "version": "1.0.27",
   "private": true,
   "description": "Framework-free Electron RPA development and agent workstation",
   "main": "src/main.js",
@@ -14,6 +14,7 @@
     "test:design": "electron tests/electron-design.js",
     "test:auth": "electron tests/electron-auth.js",
     "test:analysis": "electron tests/electron-task-analysis.js",
+    "test:html": "electron tests/electron-html-input.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --win nsis"
   },

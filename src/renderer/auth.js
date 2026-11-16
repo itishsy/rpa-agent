@@ -40,7 +40,9 @@ async function applyUser(user,loginState){
   window.taskMonitor?.dispose?.();window.taskMonitor=null
   for(const host of ['monitorHost','taskSourceSettingsHost'])$(host).shadowRoot?.replaceChildren()
   connections=[];renderConnections()
-  for(const field of ['modelApiKey','localDebugToken','modelBaseUrl','modelName'])$(field).value=''
+  for(const field of ['modelApiKey','localDebugToken','modelBaseUrl','modelName','additionalModelNames'])$(field).value=''
+  composerModelRevision++;renderComposerModels([])
+  attachmentDrafts.clear()
   clearWorkspace();copied=null;managed.app=null;managed.rows=[];managed.completeFlows=[];managed.flows=[];managed.platformId='';managed.page=1;managed.appRequest++;managed.flowRequest++
   schemaCache.clear();renderApplicationTable([]);$('flowManagementTable').replaceChildren();$('request').value=''
   $('executorCards').replaceChildren()

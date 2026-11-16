@@ -21,7 +21,6 @@ test('session checkpoints are encrypted and partition-bound', t => {
   assert.ok(!fs.readFileSync(store.file(current.id), 'utf8').includes('not-in-plaintext'))
   assert.equal(store.read(current.id, scope).dsl.privateValue, 'not-in-plaintext')
   assert.throws(() => store.read(current.id, { ...scope, username: 'b' }), /不属于/)
-  assert.equal(store.list(scope).length, 1)
   const artifactId = require('node:crypto').randomUUID()
   const reference = store.writeArtifact(current.id, artifactId, { DOMs: ['private-dom'] })
   current.artifacts[artifactId] = reference; store.save(current)

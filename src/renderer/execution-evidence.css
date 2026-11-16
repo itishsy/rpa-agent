@@ -1,0 +1,67 @@
+#jsonDialog.execution-details[open] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#jsonDialog.execution-details > form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.execution-details .panel-heading,
+.execution-details #dialogHelp {
+  flex: none;
+}
+.execution-details #dialogList {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+#executionEvidenceDialog {
+  width: min(1100px, calc(100vw - 64px));
+  height: min(760px, calc(100vh - 64px));
+  max-width: none;
+  padding: 22px;
+  overflow: hidden;
+}
+#executionEvidenceDialog[open] {
+  display: grid;
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+  gap: 12px;
+}
+#executionEvidenceDialog label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+}
+#executionEvidenceDialog select {
+  width: auto;
+  max-width: 85%;
+  margin: 0;
+}
+#executionEvidenceSummary { margin: 0; overflow-wrap: anywhere; }
+.evidence-tabs {
+  display: flex;
+  gap: 6px;
+  border-bottom: 1px solid var(--line);
+}
+.evidence-tabs button {
+  border-color: transparent;
+  border-bottom: 2px solid transparent;
+  border-radius: 6px 6px 0 0;
+}
+.evidence-tabs button[aria-selected="true"] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+#executionEvidencePanel {
+  overflow: auto;
+  min-height: 0;
+  padding: 4px 6px 12px;
+  overflow-wrap: anywhere;
+}
+#executionEvidencePanel label { margin-bottom: 12px; }
+#executionEvidencePanel img { display: block; max-width: 100%; height: auto; margin: 12px 0; }
+.evidence-dom { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }

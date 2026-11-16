@@ -105,7 +105,7 @@ async function syncApplicationSelection(app) {
   $('application').value = app.appCode
   await loadFlows()
 }
-async function openFlowManagement(app, taskName, mainOnly=false) {
+async function openFlowManagement(app, taskName, mainOnly=false, serviceItem) {
   if(typeof resetFlowFilterSearch==='function')resetFlowFilterSearch()
   managed.app = app; managed.flowRequest++
   $('managedAppName').textContent = (app.appName || app.appCode) + ' · RPA流程管理'; $('managedAppCode').textContent = app.appCode
@@ -114,12 +114,13 @@ async function openFlowManagement(app, taskName, mainOnly=false) {
   $('application').value=app.appCode
   $('flowKeyword').value = ''; [...$('flowTypes').options].forEach(option=>{option.selected=!mainOnly||option.value==='1'})
   selectOptions($('flowServices'),SERVICE_ITEMS,item=>String(item[0]),item=>item[1])
-  ;[...$('flowServices').options].forEach(option=>{option.selected=!!taskName&&option.textContent===taskName})
+  if(serviceItem!=null&&![...$('flowServices').options].some(option=>option.value===String(serviceItem)))$('flowServices').add(new Option(taskName,String(serviceItem)))
+  ;[...$('flowServices').options].forEach(option=>{option.selected=serviceItem!=null?option.value===String(serviceItem):!!taskName&&option.textContent===taskName})
   managed.completeFlows = await business('flows',{appCode:app.appCode})
-  flowRows=managed.completeFlows;selectOptions($('flow'),flowRows,item=>item.flowCode,item=>(item.relationFlowCode?'↗ ':'')+item.flowName,'选择流程')
+  flowRows=managed.completeFlows;selectOptions($('flow'),flowRows,item=>item.flowCode,item=>item.flowName,'选择流程')
   const systems = [...new Map(managed.completeFlows.filter(row=>row.declareSystem!==null&&row.declareSystem!==undefined&&row.declareSystem!=='').map(row=>[String(row.declareSystem),[row.declareSystem,row.declareSystemName||row.declareSystem]])).values()]
   selectOptions($('flowSystems'),systems,item=>String(item[0]),item=>item[1]); [...$('flowSystems').options].forEach(option=>{option.selected=false})
-  if (taskName && !SERVICE_ITEMS.some(item=>item[1]===taskName)) $('flowKeyword').value = taskName
+  if (taskName && serviceItem==null && !SERVICE_ITEMS.some(item=>item[1]===taskName)) $('flowKeyword').value = taskName
   setView('flowManagement'); await loadManagedFlows(taskName?null:managed.completeFlows.filter(row=>!mainOnly||Number(row.flowType)===1))
 }
 async function loadManagedFlows(initialRows=null) {
@@ -134,7 +135,7 @@ async function loadManagedFlows(initialRows=null) {
   managed.flows = rows.filter(row=>!keyword||String(row.flowName||'').toLowerCase().includes(keyword)).sort((a,b)=>Number(a.execOrder)-Number(b.execOrder))
   table($('flowManagementTable'),[
     {key:'execOrder',label:'执行顺序'},{key:'serviceItemName',label:'服务项目'},{label:'流程类型',format:row=>Number(row.flowType)===2?'子流程':'主流程'},
-    {key:'declareSystemName',label:'申报系统'},{key:'runSupportName',label:'运行载体'},{label:'流程名称',format:row=>(row.relationFlowCode?'↗ ':'')+row.flowName},
+    {key:'declareSystemName',label:'申报系统'},{key:'runSupportName',label:'运行载体'},{label:'流程名称',format:row=>row.flowName},
     {key:'comment',label:'备注'},{key:'tagName',label:'标签'},{label:'更新时间',format:row=>shortTime(row.updateTime)}
   ],managed.flows,row=>[
     ['AI配置',()=>openManagedSteps(row)],['编辑',()=>flowForm('edit',row)]
@@ -214,6 +215,68 @@ function applicationOperation(row, operation) {
   refs[key]=formField(content,key,operation==='releaseApplication'?'更新内容（最多500字）':'原因说明',{type:'textarea',required:true,wide:true})
   if(operation==='releaseApplication')refs[key].maxLength=500
 }
+const pendingProductionSync = new Map()
+const RELEASE_REASONS = ['新应用上线','流程配置缺陷','流程优化','网站新场景','网页元素变化','网站业务变更']
+function assertSavedSteps(appCode) {
+  const hasDraft = [...workspaceTabs].some(([id,tab])=>{
+    const session=id===current?.id?current:tab.data.session
+    return session.scope.appCode===appCode && !session.readOnly &&
+      ((id===current?.id?inputDirty():tab.view?.dirty) || pretty(session.dsl)!==pretty(session.savedBaseline))
+  })
+  if(hasDraft)throw new Error('该应用有未保存的步骤，请先在步骤页保存，再同步生产')
+}
+async function openProductionSync() {
+  const appCode=managed.app?.appCode, platformId=managed.platformId
+  if(!appCode)throw new Error('请选择应用')
+  const app=await business('application',{appCode})
+  if(managed.app?.appCode!==appCode||managed.platformId!==platformId)return
+  const key=JSON.stringify([platformId,appCode])
+  let pending=pendingProductionSync.get(key)
+  if(!pending)assertSavedSteps(appCode)
+  if(pending&&!pending.version&&app.version&&
+      (pending.expectedRelease ? String(app.version).toLowerCase()===pending.expectedRelease.toLowerCase() : app.version!==pending.previousVersion))pending.version=app.version
+  const help=()=>pending
+    ? (app.appName||appCode)+' · 已发布 '+(pending.version||'新版本')+'，等待同步到生产。'
+    : (app.appName||appCode)+' · 当前版本 '+(app.version||'未发布')+'。将发布整个应用，再同步到生产。'
+  const content=nativeForm('同步生产',help(),async()=>{
+    const retry=!!pending
+    if(!retry)assertSavedSteps(appCode)
+    if(retry&&!pending.version)throw new Error('无法确认已发布版本，请关闭弹窗并重新打开以读取版本')
+    const result=await business('releaseToProduction',{appCode,expectedVersion:retry?pending.version:app.version,
+      syncOnly:retry,rule:rule.value,changeReason:reason.value,comment:comment.value})
+    if(result.synced){
+      pendingProductionSync.delete(key)
+      notice('应用已同步到生产 · '+result.version)
+      return
+    }
+    pending={version:result.version,expectedRelease:result.expectedRelease,previousVersion:app.version,comment:comment.value}
+    pendingProductionSync.set(key,pending)
+    showRetry()
+    throw new Error('版本已发布，生产同步未完成：'+result.error)
+  })
+  if(!pending&&Number(app.problemCount)>0){
+    const warning=document.createElement('div')
+    warning.className='wide form-error';warning.textContent='该应用仍有 '+app.problemCount+' 个问题流程。'
+    content.append(warning)
+  }
+  const rule=formField(content,'rule','版本规则',{value:'补丁',options:[['主版本号','主版本'],['子版本号','子版本'],['补丁','补丁']],required:true})
+  const reason=formField(content,'changeReason','变更原因',{options:RELEASE_REASONS.map(item=>[item,item]),required:true})
+  const comment=formField(content,'comment','更新与同步说明',{type:'textarea',value:pending?.comment,required:true,wide:true})
+  comment.maxLength=500
+  function showRetry(){
+    for(const field of [rule,reason]){field.disabled=true;field.parentElement.hidden=true}
+    $('businessHelp').textContent=help()
+    $('businessSave').textContent='重试同步'
+  }
+  if(pending)showRetry()
+  else $('businessSave').textContent='确认发布并同步'
+}
+desktop.on('application:released',appCode=>{
+  if(!managed.platformId)return
+  if(document.documentElement.dataset.windowMode!=='design' && managed.rows.some(row=>row.appCode===appCode)){
+    loadApplicationTable().catch(error=>notice('版本状态刷新失败：'+error.message,true))
+  }
+})
 async function showVersions(row) {
   const result=await business('versions',{appCode:row.appCode}), content=nativeForm('历史版本 · '+row.appName,'选择历史版本后仍需确认激活。',async()=>{},{readonly:true});content.className=''
   table(content,[{key:'version',label:'版本号'},{key:'comment',label:'更新内容'},{key:'createName',label:'操作人'},{label:'时间',format:item=>shortTime(item.createTime||item.releaseTime)}],rowsOf(result),version=>[['使用此版本',async()=>{
@@ -223,12 +286,12 @@ async function showVersions(row) {
 async function flowForm(mode='add', row) {
   if(!managed.app)throw new Error('请先选择应用')
   const app=managed.app, args=safeObject(app.appArgs)
-  const [systems,carriers,tags,templates,sources]=await Promise.all([
+  const [systems,carriers,tags,sources]=await Promise.all([
     business('dictionary',{key:Number(args.businessType)===1001001?'10007':'10008'}),business('robotDictionary',{key:'10019'}),
-    business('robotDictionary',{key:'10018'}),business('templates'),mode==='copyAdd'?business('flowSources'):Promise.resolve(managed.completeFlows)
+    business('robotDictionary',{key:'10018'}),mode==='copyAdd'?business('flowSources'):Promise.resolve(managed.completeFlows)
   ])
-  const refs={}, titles={add:'添加流程',edit:'编辑流程',copyAdd:'复制现有流程',relateAdd:'关联已有流程'}
-  const content=nativeForm(titles[mode],mode==='edit'?'编辑流程配置和执行顺序，保存后生效；删除操作位于下方。':'自定义主流程可按服务项目生成；复制、关联和编辑不会自动生成。',async()=>{
+  const refs={}, titles={add:'添加流程',edit:'编辑流程',copyAdd:'复制现有流程'}
+  const content=nativeForm(titles[mode],mode==='edit'?'编辑流程配置和执行顺序，保存后生效；删除操作位于下方。':'自定义主流程可按服务项目生成；复制和编辑不会自动生成。',async()=>{
     const input=Object.fromEntries(Object.entries(refs).map(([key,control])=>[key,control.value]))
     if(mode==='add'&&input.flowType==='1'&&generate.checked){
       if(!input.serviceItem)throw new Error('生成步骤前请选择服务项目')
@@ -247,7 +310,7 @@ async function flowForm(mode='add', row) {
       await refreshManagedFlows();notice('流程已保存')
     }
   })
-  const addMode=formField(content,'addMode','添加方式',{value:mode,options:[['add','自定义'],['copyAdd','复制现有'],['relateAdd','关联已有'],...(mode==='edit'?[['edit','编辑当前流程']]:[])],disabled:mode==='edit'})
+  const addMode=formField(content,'addMode','添加方式',{value:mode,options:[['add','自定义'],['copyAdd','复制现有'],...(mode==='edit'?[['edit','编辑当前流程']]:[])],disabled:mode==='edit'})
   if(mode==='edit')addMode.parentElement.hidden=true
   addMode.onchange=managementAction(async()=>{$('businessDialog').close();await flowForm(addMode.value,row)})
   refs.flowName=formField(content,'flowName','流程名称',{value:mode==='edit'?row?.flowName:row?row.flowName+' 副本':'',required:true})
@@ -256,17 +319,16 @@ async function flowForm(mode='add', row) {
   refs.declareSystem=formField(content,'declareSystem','申报系统',{value:row?.declareSystem,options:rowsOf(systems).map(item=>[item.dictCode,item.dictName]),required:true})
   refs.runSupport=formField(content,'runSupport','运行载体',{value:row?.runSupport,options:rowsOf(carriers).map(item=>[item.dictCode,item.dictName]),required:true})
   refs.tagCode=formField(content,'tagCode','标签',{value:row?.tagCode,options:rowsOf(tags).map(item=>[item.dictCode,item.dictName])})
-  refs.templateFlowCode=formField(content,'templateFlowCode','模板引用',{value:row?.templateFlowCode,options:rowsOf(templates).map(item=>[item.flowCode,item.flowName]),disabled:mode==='relateAdd'})
-  if(['copyAdd','relateAdd'].includes(mode))refs.sourceFlowCode=formField(content,'sourceFlowCode','来源流程',{value:row?.flowCode,options:rowsOf(sources).map(item=>[item.flowCode,item.appNameAndFlowName||item.flowName]),required:true})
+  if(mode==='copyAdd')refs.sourceFlowCode=formField(content,'sourceFlowCode','来源流程',{value:row?.flowCode,options:rowsOf(sources).map(item=>[item.flowCode,item.appNameAndFlowName||item.flowName]),required:true})
   const label=document.createElement('label');label.className='wide checkbox';const generate=document.createElement('input');generate.type='checkbox';generate.checked=true;label.append(generate,'根据服务项目生成步骤');content.append(label)
-  const flowTypeChanged=()=>{const child=refs.flowType.value==='2';if(child)refs.serviceItem.value='';refs.serviceItem.disabled=child;refs.templateFlowCode.disabled=mode==='relateAdd'||mode==='add'&&child;if(mode==='add'&&child)refs.templateFlowCode.value='';label.hidden=mode!=='add'||child}
+  const flowTypeChanged=()=>{const child=refs.flowType.value==='2';if(child)refs.serviceItem.value='';refs.serviceItem.disabled=child;label.hidden=mode!=='add'||child}
   refs.flowType.onchange=flowTypeChanged;flowTypeChanged()
   if(mode==='edit'){
     refs.execOrder=formField(content,'execOrder','执行顺序（保存时生效）',{value:row.execOrder,type:'number',required:true})
     refs.execOrder.min=Math.min(...managed.completeFlows.map(item=>Number(item.execOrder)));refs.execOrder.max=Math.max(...managed.completeFlows.map(item=>Number(item.execOrder)));refs.execOrder.step='1'
     const more=document.createElement('details');more.className='wide flow-edit-more';const moreTitle=document.createElement('summary');moreTitle.textContent='其他流程操作';more.append(moreTitle)
     const hint=document.createElement('p');hint.className='muted';hint.textContent='以下操作使用已保存的流程配置；当前表单输入不会自动保存。';more.append(hint)
-    for(const [title,work] of [['复制流程',()=>flowForm('copyAdd',row)],['关联流程',()=>flowForm('relateAdd',row)],['调整状态',()=>flowStatusForm(row)],['状态历史',()=>flowHistory(row)]]){
+    for(const [title,work] of [['复制流程',()=>flowForm('copyAdd',row)],['调整状态',()=>flowStatusForm(row)],['状态历史',()=>flowHistory(row)]]){
       const button=document.createElement('button');button.type='button';button.textContent=title;button.onclick=managementAction(async()=>{$('businessDialog').close();await work()});more.append(button)
     }
     content.append(more)
