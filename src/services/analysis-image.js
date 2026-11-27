@@ -7,8 +7,15 @@ async function readAnalysisImage(server, fileId, signal) {
   const base = String(server.baseServer).replace(/\/+$/, '')
   const url = new URL((/\/api$/i.test(base) ? base : base + '/api') + '/policy/sys/file/download/' + encodeURIComponent(fileId))
   return new Promise((resolve, reject) => {
-    const req = (url.protocol === 'https:' ? https : http).get(url, { signal, timeout: 25000, headers: { Authorization: 'Bearer ' + token } }, response => {
-      if (response.statusCode !== 200) { response.resume(); reject(new Error('截图接口不可用（HTTP ' + response.statusCode + '）')); return }
+    const headers = token ? { Authorization: 'Bearer ' + token } : {}
+    const req = (url.protocol === 'https:' ? https : http).get(url, { signal, timeout: 25000, headers }, response => {
+      if (response.statusCode !== 200) {
+        response.resume()
+        const message = [401, 403].includes(response.statusCode)
+          ? '代理服务登录态无效，请先登录代理服务或配置登录账户和密码'
+          : '截图接口不可用（HTTP ' + response.statusCode + '）'
+        reject(new Error(message)); return
+      }
       const chunks = []; let bytes = 0
       response.on('data', chunk => { bytes += chunk.length; if (bytes > 5 * 1024 * 1024) req.destroy(new Error('截图超过5MiB')); else chunks.push(chunk) })
       response.on('error', reject)

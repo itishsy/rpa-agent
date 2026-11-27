@@ -4,7 +4,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js')
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js')
 const { createMcpExpressApp } = require('@modelcontextprotocol/sdk/server/express.js')
 
-function createMcpBridge({ registry, invoke }) {
+function createMcpBridge({ registry, invoke, formatResult = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }] }) }) {
   const token = randomBytes(32).toString('hex')
   const app = createMcpExpressApp({ host: '127.0.0.1' })
   let server
@@ -18,7 +18,7 @@ function createMcpBridge({ registry, invoke }) {
     const controller = new AbortController()
     const mcp = new McpServer({ name: 'rpa-agent', version: '1.0.0' })
     for (const tool of registry.tools.values()) mcp.registerTool(tool.name, { description: tool.description, inputSchema: tool.schema }, async args => {
-      try { return { content: [{ type: 'text', text: JSON.stringify(await invoke(tool.name, args, controller.signal)) }] } }
+      try { return formatResult(await invoke(tool.name, args, controller.signal)) }
       catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] } }
     })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })

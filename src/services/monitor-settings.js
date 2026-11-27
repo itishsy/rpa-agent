@@ -1,5 +1,6 @@
 'use strict'
 const { normalizeKeywords } = require('./undeclared-monitor')
+const { isProxyPath } = require('./proxy-auth')
 function normalizedServer(value) {
   const url = new URL(String(value || '').trim())
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('监控服务地址须为不含凭据或查询参数的 HTTP(S) 地址')
@@ -15,12 +16,14 @@ function prepareServers(previous,input){
   const keys = new Set()
   const servers = input.map(item => {
     const baseServer = normalizedServer(item.baseServer), username = String(item.username || '').trim()
-    if (!username) throw new Error('请填写监控用户名')
     const key = JSON.stringify([baseServer, username])
     if (keys.has(key)) throw new Error('监控服务与账号不能重复')
     keys.add(key)
     const old = previous.find(server => normalizedServer(server.baseServer) === baseServer && server.username === username)
     const password = item.clearPassword ? '' : String(item.password || old?.password || '')
+    if (!isProxyPath(baseServer) && !!username !== !!password) {
+      throw new Error('登录账户和密码须同时填写；代理服务已登录时可同时留空')
+    }
     return { baseServer, username, password }
   })
   return servers

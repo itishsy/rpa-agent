@@ -13,6 +13,9 @@ test('executor proxy paths are normalized and kept distinct',()=>{
  assert.throws(()=>normalizeBaseUrl(address+'?key=test'),/查询参数/)
  assert.equal(runtimeUrl({baseUrl:address,runtimeUrl:'https://runtime.example.test/agent-proxy/'}),'https://runtime.example.test/agent-proxy')
  assert.throws(()=>runtimeUrl({baseUrl:address}),/填写对应的 Runtime 地址/)
+ assert.throws(()=>runtimeUrl({baseUrl:address},true),/填写对应的 Runtime 地址/)
+ assert.equal(runtimeUrl({baseUrl:address+'/9090'},true),address+'/19090')
+ assert.equal(runtimeUrl({baseUrl:address+'/9090',runtimeUrl:'https://runtime.example.test/status-proxy'},true),'https://runtime.example.test/status-proxy')
 })
 test('takeover uses configured runtime and requires a unique task account',()=>{
  assert.equal(runtimeUrl({baseUrl:'http://192.0.2.10:9090'}),'http://192.0.2.10:19090')

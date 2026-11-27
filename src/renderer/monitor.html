@@ -41,7 +41,7 @@
         <h3 class="monitor-apps-title">配置数据源</h3>
         <div class="server-header"><span>base_server</span><span>username</span><span>password</span><span></span></div>
         <div id="serverRows"></div>
-        <div class="hint">密码留空表示保留原密码；新增或修改服务地址时需重新填写密码。缴费任务账户由系统设置中的“任务监控设置”统一管理。</div>
+        <div class="hint">服务地址包含 <code>/virwin/</code> 时按代理登录态直连，账户和密码可任意留空或忽略；其他地址须同时填写。密码留空会保留同地址、同账户已保存的密码。缴费任务账户由系统设置中的“任务监控设置”统一管理。</div>
       </div>
       <div class="settings-footer">
         <button id="addServerButton" class="button" type="button">添加服务</button>

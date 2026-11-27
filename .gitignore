@@ -2,3 +2,5 @@ node_modules/
 release/
 artifacts/
 *.log
+/cache/
+/.idea/

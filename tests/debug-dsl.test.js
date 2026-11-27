@@ -99,11 +99,18 @@ test('DSL conversion preserves execution strategies, both argument maps, app met
     skipCondition: 'condition', waitBefore: 2, waitAfter: 3, timeout: 4, maxExecuteNum: 5,
     actionArgs: { zero: 0, empty: '', disabled: false }, targetArgs: { xpath: '//body' } }
   const dsl = buildDebugDsl('app', 'main', metadata, [row, { ...step('block'), actionCode: 'codeBlock', list: [step('inner')] }])
-  assert.deepEqual(dsl.steps[0], row)
+  const { falseSkipTo, ...canonical } = row
+  assert.deepEqual(dsl.steps[0], canonical)
   assert.equal(dsl.steps[1].body[0].stepCode, 'inner')
   for (const field of ['appArgs', 'declareSystem', 'serviceItem', 'tagCode', 'runSupport', 'sessionKeep']) {
     assert.deepEqual(dsl[field], metadata[field])
   }
+})
+
+test('legacy falseSkipTo is migrated to the IDE failedSkipTo field', () => {
+  const dsl = buildDebugDsl('app', 'main', root(), [{ ...step(), falseSkipTo: 'NEXT' }])
+  assert.equal(dsl.steps[0].failedSkipTo, 'NEXT')
+  assert.equal(Object.hasOwn(dsl.steps[0], 'falseSkipTo'), false)
 })
 
 test('nested and flat native rows preserve every step; invalid hierarchy cannot be silently flattened', () => {
@@ -183,12 +190,76 @@ test('missing local calls never fall back to public catalogs',async()=>{
  assert.equal(retiredReads,0)
 })
 
-test('legacy cross-application links do not change call ownership',async()=>{
- const looked=[]
- await assert.rejects(loadReferencedDebugFlows(root(),'app',api([{flowCode:'main',flowName:'主流程',relationFlowCode:'other'}],{
- listFlows:async code=>{looked.push(code);return []},getFlow:async()=>{throw new Error('不可读取旧引用')}
- })),/未找到当前应用/)
- assert.deepEqual(looked,['app'])
+test('an explicit reference loads nested calls from the source app and keeps the alias identity', async () => {
+  const looked = [], stepReads = []
+  const bundle = await loadReferencedDebugFlows(root([call('引用流程')]), 'app', {
+    listFlows: async app => {
+      looked.push(app)
+      return app === 'app'
+        ? [{ flowCode: 'alias', flowName: '引用流程', relationFlowCode: 'source' }, { flowCode: 'local', flowName: '末级' }]
+        : [{ flowCode: 'leaf', flowName: '末级' }]
+    },
+    getFlow: async flowCode => ({ flowCode, appCode: 'source-app', flowName: '来源流程' }),
+    listSteps: async flow => {
+      stepReads.push(flow.flowCode)
+      return flow.flowCode === 'alias' ? [] : flow.flowCode === 'source' ? [call('末级')] : [step()]
+    }
+  })
+  assert.deepEqual(looked, ['app', 'source-app'])
+  assert.deepEqual(stepReads, ['alias', 'source', 'leaf'])
+  assert.deepEqual(bundle.subflows.map(flow => flow.flowCode), ['alias', 'leaf'])
+  assert.equal(bundle.subflows[0].flowName, '引用流程')
+})
+
+test('enrollment and register flows share a referenced login across application aliases', async () => {
+  for (const options of [{}, { validate: false }, { inspect: true }]) {
+    const reads = []
+    const catalog = {
+      app: [
+        { flowCode: 'register-alias', flowName: '医疗在册主流程', relationFlowCode: 'register-source' },
+        { flowCode: 'login-alias', flowName: '医疗登录', relationFlowCode: 'login-source' }
+      ],
+      source: [{ appCode: 'source', flowCode: 'login-source', flowName: '医疗登录' }]
+    }
+    const bundle = await loadReferencedDebugFlows(root([call('医疗在册主流程'), call('医疗登录')]), 'app', {
+      listFlows: async owner => catalog[owner],
+      getFlow: async code => ({ appCode: 'source', flowCode: code,
+        flowName: code === 'register-source' ? '医疗在册主流程' : '医疗登录' }),
+      listSteps: async flow => {
+        reads.push(flow.flowCode)
+        if (flow.relationFlowCode) return []
+        return flow.flowCode === 'register-source' ? [call('医疗登录')] : [step('实际登录')]
+      }
+    }, options)
+    assert.deepEqual(bundle.subflows.map(flow => flow.flowCode), ['register-alias', 'login-alias'])
+    assert.deepEqual(bundle.subflows[1].steps, [step('实际登录')])
+    assert.equal(reads.filter(code => code === 'login-source').length, 1)
+    assert.deepEqual(bundle.inspectionDiagnostics || [], [])
+  }
+})
+
+test('repeated calls to the same local login load it only once', async () => {
+  const reads = []
+  const bundle = await loadReferencedDebugFlows(root([call('在册'), call('登录')]), 'app', api([
+    { flowCode: 'register', flowName: '在册' }, { flowCode: 'login', flowName: '登录' }
+  ], { listSteps: async flow => {
+    reads.push(flow.flowCode)
+    return flow.flowCode === 'register' ? [call('登录')] : [step()]
+  } }))
+  assert.deepEqual(bundle.subflows.map(flow => flow.flowCode), ['register', 'login'])
+  assert.deepEqual(reads, ['register', 'login'])
+})
+
+test('same-name logins with different reference sources still report a conflict', async () => {
+  await assert.rejects(loadReferencedDebugFlows(root([call('在册'), call('登录')]), 'app', {
+    listFlows: async owner => owner === 'app' ? [
+      { flowCode: 'register', flowName: '在册', relationFlowCode: 'source-register' },
+      { flowCode: 'local-login', flowName: '登录' }
+    ] : [{ appCode: 'source', flowCode: 'source-login', flowName: '登录' }],
+    getFlow: async code => ({ appCode: 'source', flowCode: code, flowName: '在册' }),
+    listSteps: async flow => flow.flowCode === 'register' ? [] :
+      flow.flowCode === 'source-register' ? [call('登录')] : [step()]
+  }), /同名流程来源冲突/)
 })
 
 test('disabled calls are omitted from the closure, while enabled ordinary children and code blocks remain complete', async () => {
@@ -226,6 +297,6 @@ test('an incomplete bundle and dangling jumps fail integrity checks, while NEXT 
 
 test('reference cycles stop loading and malformed steps fail instead of masquerading as an empty alias', async () => {
   const flows = [{ flowCode: 'main', flowName: '主流程' }, { flowCode: 'alias', flowName: '医疗增员单个', relationFlowCode: 'alias' }]
-  await assert.rejects(loadReferencedDebugFlows(root(), 'app', api(flows, { listSteps: async () => [] })), /步骤/)
+  await assert.rejects(loadReferencedDebugFlows(root(), 'app', api(flows, { listSteps: async () => [] })), /引用关系存在循环/)
   await assert.rejects(loadReferencedDebugFlows(root(), 'app', api(flows, { listSteps: async () => ({ rows: [] }) })), /步骤.*数组|步骤.*格式/)
 })

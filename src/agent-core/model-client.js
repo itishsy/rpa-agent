@@ -58,9 +58,25 @@ async function completeChat (settings, apiKey, input, fetcher = fetch, signal) {
       }
     }
     let raw = await response.text()
-    if (response.status === 400 && /reasoning_content/i.test(raw) && /must|missing|required|缺少/i.test(raw) &&
-        messages.some(message => message.role === 'assistant' && message.tool_calls?.length && message.reasoning_content == null)) {
-      withReasoning()
+    // Each repair changes one rejected parameter, without dispatching tools.
+    for (let repair = 0; repair < 2 && response.status === 400; repair++) {
+      if (/reasoning_content/i.test(raw) && /must|missing|required|缺少/i.test(raw) &&
+          messages.some(message => message.role === 'assistant' && message.tool_calls?.length && message.reasoning_content == null)) {
+        withReasoning()
+      } else if (/thinking mode/i.test(raw) && /tool_choice/i.test(raw) &&
+          /does not support|not supported|unsupported/i.test(raw) &&
+          body.tool_choice != null && body.tool_choice !== 'auto') {
+        const name = body.tool_choice?.function?.name
+        if (name) {
+          const tool = body.tools?.find(item => item.function?.name === name)
+          if (!tool) break
+          body.tools = [tool]
+        }
+        if (body.tool_choice === 'none') delete body.tools
+        if (body.tools?.length) body.tool_choice = 'auto'
+        else delete body.tool_choice
+      } else break
+      if (controller.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' })
       response = await fetcher(url, { ...options, body: JSON.stringify(body) })
       raw = await response.text()
     }

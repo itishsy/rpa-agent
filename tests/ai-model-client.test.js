@@ -118,3 +118,58 @@ test('missing reasoning_content on legacy tool history retries once without repl
   assert.equal(attempts,2);assert.equal(result.message.content,'证据不足')
   assert.equal(Object.hasOwn(messages[2],'reasoning_content'),false)
 })
+
+test('thinking mode retries a rejected named tool choice with only that tool and preserves reasoning history', async () => {
+  const calls = [{ id: 'read', type: 'function', function: { name: 'get_flow_context', arguments: '{}' } }]
+  const messages = [...input.messages, { role: 'assistant', content: '', reasoning_content: 'retained reasoning', tool_calls: calls },
+    { role: 'tool', tool_call_id: 'read', content: '{}' }]
+  const tools = ['get_flow_context', 'propose_dsl_patch'].map(name => ({ type: 'function', function: { name, parameters: { type: 'object' } } }))
+  const request = { ...input, messages, tools, toolChoice: { type: 'function', function: { name: 'propose_dsl_patch' } } }
+  const before = JSON.stringify(request)
+  let attempts = 0
+  const result = await completeChat(settings, '', request, async (_, options) => {
+    const body = JSON.parse(options.body)
+    assert.equal(body.messages[2].reasoning_content, 'retained reasoning')
+    if (++attempts === 1) return { ok: false, status: 400,
+      text: async () => JSON.stringify({ error: { message: 'Thinking mode does not support this tool_choice' } }) }
+    assert.equal(body.tool_choice, 'auto')
+    assert.deepEqual(body.tools, [tools[1]])
+    return { ok: true, text: async () => JSON.stringify({ choices: [{ finish_reason: 'tool_calls',
+      message: { tool_calls: [{ id: 'patch', type: 'function', function: { name: 'propose_dsl_patch', arguments: '{}' } }] } }] }) }
+  })
+  assert.equal(attempts, 2)
+  assert.equal(result.message.tool_calls[0].function.name, 'propose_dsl_patch')
+  assert.equal(JSON.stringify(request), before)
+})
+
+test('thinking compatibility keeps final responses tool-free and can repair legacy reasoning on the next rejection', async () => {
+  const messages = [...input.messages, { role: 'assistant', tool_calls: [
+    { id: 'read', type: 'function', function: { name: 'get_flow_context', arguments: '{}' } }
+  ] }, { role: 'tool', tool_call_id: 'read', content: '{}' }]
+  let attempts = 0
+  const result = await completeChat(settings, '', { ...input, messages, finalOnly: true }, async (_, options) => {
+    const body = JSON.parse(options.body)
+    assert.equal(body.tools, undefined)
+    attempts++
+    if (attempts === 1) return { ok: false, status: 400, text: async () => 'Thinking mode does not support this tool_choice' }
+    assert.equal(Object.hasOwn(body, 'tool_choice'), false)
+    if (attempts === 2) return { ok: false, status: 400, text: async () => 'reasoning_content in thinking mode must be passed back' }
+    assert.equal(body.messages[2].reasoning_content, '')
+    return { ok: true, text: async () => JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '分析完成' } }] }) }
+  })
+  assert.equal(attempts, 3)
+  assert.equal(result.message.content, '分析完成')
+})
+
+test('unrelated bad requests and repeated tool-choice rejections stop without unbounded retries', async () => {
+  for (const error of ['Invalid API key', 'Thinking mode does not support this tool_choice']) {
+    let attempts = 0
+    await assert.rejects(completeChat(settings, '', { ...input, tools: [
+      { type: 'function', function: { name: 'read', parameters: { type: 'object' } } }
+    ], toolChoice: 'required' }, async () => {
+      attempts++
+      return { ok: false, status: 400, text: async () => error }
+    }), /模型 API 返回 400/)
+    assert.equal(attempts, error.startsWith('Thinking') ? 2 : 1)
+  }
+})

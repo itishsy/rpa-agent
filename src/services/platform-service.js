@@ -1,5 +1,6 @@
 const fs = require('fs')
 const path = require('path')
+const { atomicWriteFileSync } = require('./atomic-file')
 const http = require('http')
 const https = require('https')
 const { randomUUID, createHash, createCipheriv } = require('crypto')
@@ -68,8 +69,7 @@ function createPlatformService({ filePath, safeStorage, defaults, request = requ
   }
   function write(list) {
     fs.mkdirSync(path.dirname(filePath), { recursive: true })
-    fs.writeFileSync(filePath + '.tmp', JSON.stringify(list, null, 2), { mode: 0o600 })
-    fs.renameSync(filePath + '.tmp', filePath)
+    atomicWriteFileSync(filePath, JSON.stringify(list, null, 2))
   }
   function encrypt(value) {
     if (!safeStorage.isEncryptionAvailable()) throw new Error('系统凭据加密不可用，无法保存密码或 Token')

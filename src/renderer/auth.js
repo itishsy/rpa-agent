@@ -73,7 +73,7 @@ $('userLoginForm').onsubmit=async event=>{
   $('userLoginSubmit').disabled=true;$('userLoginMessage').textContent='正在登录并读取用户权限…'
   const input={username:$('userLoginName').value,password:$('userLoginPassword').value,baseUrl:$('userLoginServer').value,rememberPassword:$('userLoginRemember').checked}
   try{
-    const user=await invoke('auth:login',input);await applyUser(user);$('userLoginMessage').textContent=''
+    const user=await invoke('auth:login',input);await applyUser(user);$('userLoginMessage').textContent=user.settingsWarning||''
   }catch(error){$('userLoginMessage').textContent=loginError(error)}
   finally{$('userLoginPassword').value='';$('userLoginSubmit').disabled=false}
 }

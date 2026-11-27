@@ -1,18 +1,20 @@
 // Shared by the IDE renderer and the MCP bridge. No model or transport dependency.
 const STEP_FIELDS = new Set([
   'stepName', 'status', 'failedRetry', 'failedStrategy', 'skipTo', 'failedSkipTo',
-  'falseSkipTo', 'skipCondition', 'waitBefore', 'waitAfter', 'timeout', 'maxExecuteNum'
+  'skipCondition', 'waitBefore', 'waitAfter', 'timeout', 'maxExecuteNum'
 ])
 const ARG_FIELDS = new Set(['actionArgs', 'targetArgs'])
 
-const INSERT_FIELDS = new Set(['stepCode', 'actionCode', ...STEP_FIELDS, ...ARG_FIELDS])
+const INSERT_FIELDS = new Set(['stepCode', 'actionCode', 'body', 'children', ...STEP_FIELDS, ...ARG_FIELDS])
 
 function copy (value) { return JSON.parse(JSON.stringify(value)) }
 
 function locations (steps) {
   const found = new Map()
   function visit (list, parent) {
+    if (!Array.isArray(list)) throw new Error('步骤列表必须为数组')
     list.forEach((step, index) => {
+      if (!step || typeof step !== 'object' || Array.isArray(step)) throw new Error('步骤必须为对象')
       if (!step.stepCode || found.has(step.stepCode)) throw new Error('步骤 stepCode 不能为空且必须唯一')
       found.set(step.stepCode, { step, list, index, parent })
       const nested = step.body || step.children || []
@@ -40,7 +42,7 @@ function validateDsl (dsl) {
 
 function applyOperations (source, operations) {
   if (!Array.isArray(operations) || !operations.length || operations.length > 30) throw new Error('每次提交 1 至 30 个修改')
-  const dsl = copy(source)
+  const dsl = require('../shared/step-structure').normalizeFailureJumps(copy(source))
   for (const operation of operations) {
     const found = dsl.steps.length ? validateDsl(dsl) : new Map()
     const current = found.get(operation.stepCode)
@@ -55,20 +57,24 @@ function applyOperations (source, operations) {
         current.step[operation.field][operation.key] = operation.value
       } else throw new Error('不允许修改字段: ' + operation.field)
     } else if (operation.op === 'insert') {
-      const step = copy(operation.step || {})
-      if (!step.stepCode || !step.stepName || !step.actionCode || found.has(step.stepCode)) throw new Error('新步骤需要唯一的 stepCode、stepName 和 actionCode')
-      if (step.body || step.children) throw new Error('一次只能插入一个步骤')
-      for (const field of Object.keys(step)) {
-        if (!INSERT_FIELDS.has(field)) throw new Error('新步骤不支持字段: ' + field)
-      }
+      if ((operation.step !== undefined) === (operation.steps !== undefined)) throw new Error('插入操作须提供 step 或 steps 中的一项')
+      const steps = copy(operation.steps !== undefined ? operation.steps : [operation.step])
+      const inserted = validateDsl({ steps })
+      inserted.forEach(({ step }) => {
+        if (found.has(step.stepCode)) throw new Error('新步骤需要唯一的 stepCode、stepName 和 actionCode')
+        for (const field of Object.keys(step)) {
+          if (!INSERT_FIELDS.has(field)) throw new Error('新步骤不支持字段: ' + field)
+        }
+        if (step.body && step.actionCode !== 'codeBlock') throw new Error('body 只能用于代码块')
+      })
       if (operation.parentStepCode) {
         const parent = found.get(operation.parentStepCode)
         if (!parent) throw new Error('未找到父步骤')
         const field = parent.step.actionCode === 'codeBlock' ? 'body' : 'children'
         if (!parent.step[field]) parent.step[field] = []
-        parent.step[field].splice(operation.index === undefined ? parent.step[field].length : operation.index, 0, step)
+        parent.step[field].splice(operation.index === undefined ? parent.step[field].length : operation.index, 0, ...steps)
       } else {
-        dsl.steps.splice(operation.index === undefined ? dsl.steps.length : operation.index, 0, step)
+        dsl.steps.splice(operation.index === undefined ? dsl.steps.length : operation.index, 0, ...steps)
       }
     } else if (operation.op === 'remove') {
       if (!current) throw new Error('未找到步骤: ' + operation.stepCode)

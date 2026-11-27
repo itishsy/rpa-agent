@@ -60,7 +60,7 @@ const server=http.createServer(async(req,res)=>{
     if(p.endsWith('/robot/action/all'))return reply([{actionCode:'input',actionName:'输入文本'},{actionCode:'click',actionName:'点击'}])
     if(p.endsWith('/robot/action/args'))return reply(url.searchParams.get('dataCode')==='input'?[{fieldKey:'inputValue',fieldName:'输入值',fieldType:'text',required:1}]:[])
     if(p.endsWith('/robot/action/target/args'))return reply([{fieldKey:'xpath',fieldName:'元素定位',fieldType:'text',required:1}])
-    if(p.endsWith('/robot/task/listAllTask'))return reply([])
+    if(p.endsWith('/robot/task/listAllTask'))return reply([{taskCode:'html-test-account'}])
     if(p.endsWith('/robot/start/status'))return reply(0)
     throw new Error('Unexpected endpoint '+p)
   }catch(error){console.error(error.stack);res.writeHead(500);res.end(JSON.stringify({message:error.message}))}
@@ -146,6 +146,7 @@ app.on('browser-window-created',(_,win)=>win.webContents.once('did-finish-load',
     const rawArtifact=await run(`desktop.invoke('agent:artifact',current.id,${JSON.stringify(meta.artifactId)})`)
     assert.equal(rawArtifact.kind,'html_attachment');assert.ok(rawArtifact.content.length>32000)
     const fallback='[html-fallback] 仅阅读HTML，保留候选。\n'+html
+    await run('desktop.invoke("workspace:update",current.id,{taskCode:"html-test-account"})')
     await run(`desktop.invoke('agent:start',current.id,{request:${JSON.stringify(fallback)},mode:'develop'})`)
     await run('refreshSnapshot()');assert.equal(await run('current.attachments.length'),3)
     assert.match(await run('desktop.invoke("agent:start",current.id,{request:"测试",mode:"generate",modelName:"unknown"}).catch(error=>error.message)'),/请选择已配置/)

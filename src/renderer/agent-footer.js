@@ -19,10 +19,12 @@ function actionMenu(id,title,buttons){
   footer.append(trigger,menu)
 }
 $('showDsl').textContent='查看 DSL'
-actionMenu('agentSessionMenu','会话与工具',[$('showDsl'),viewExecutionDetails,$('stopAgent'),$('reconcileExecutor'),$('runCurrent'),$('runStep'),$('runCandidate'),$('continueRun'),$('steer'),$('retryTasks'),...sessionRow.children])
+$('stepRun').classList.remove('primary')
+$('stepRun').title='运行服务器上已保存的流程'
+actionMenu('agentSessionMenu','会话与工具',[$('showDsl'),viewExecutionDetails,$('stepRun'),$('stopAgent'),$('reconcileExecutor'),$('runCurrent'),$('runWithCapturePoints'),$('runStep'),$('runCandidate'),$('continueRun'),$('steer'),$('retryTasks'),...sessionRow.children])
 footer.prepend($('agentState'));agentPanel.querySelector('.panel-heading').append(footer)
 taskRow.remove();debugRow.remove();sessionRow.remove()
 const tabBar=document.createElement('div');tabBar.className='design-tabbar';$('designTabs').before(tabBar);tabBar.append($('designTabs'))
 const pageActions=document.createElement('div');pageActions.id='designPageActions';pageActions.hidden=true
-pageActions.append($('taskSelectorHost'),$('stepRun'),$('stepSave'));tabBar.append(pageActions)
+pageActions.append($('taskSelectorHost'),stepRefresh,$('stepSave'));tabBar.append(pageActions)
 window.addEventListener('resize',()=>document.querySelectorAll('.agent-action-menu:popover-open').forEach(menu=>menu.hidePopover()))

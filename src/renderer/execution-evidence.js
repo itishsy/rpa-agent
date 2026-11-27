@@ -17,6 +17,66 @@ function evidencePicker(label, options) {
   return { wrapper, picker }
 }
 
+function showExecutionRecording(panel, recording, executionCode) {
+  const reasons = { DURATION_LIMIT: '已达到录制时长上限', SIZE_LIMIT: '已达到录像大小上限', CAPTURE_FAILED: '录屏中途失败' }
+  if (recording?.status !== 'AVAILABLE' || !recording.frames?.length ||
+      recording.contentType !== 'video/x-msvideo' || !/^[A-Za-z0-9+/=]+$/.test(recording.base64 || '')) {
+    const message = recording?.status === 'UNAVAILABLE' && recording.requested
+      ? '已请求录屏，但执行器未返回录像。请核对执行器版本及录屏能力。'
+      : recording?.status === 'CAPTURE_FAILED' ? '本次录屏失败，执行器未取得桌面画面。'
+        : recording && recording.status !== 'DISABLED' ? '本次录屏未取得可播放画面，请检查执行器录屏状态。' : '本次调试未开启录屏。'
+    panel.append(evidenceText('p', message, 'muted'))
+    return () => {}
+  }
+  const binary = atob(recording.base64), frames = recording.frames
+  const controls = document.createElement('div')
+  controls.className = 'row'
+  const play = evidenceText('button', '播放')
+  play.type = 'button'
+  const seek = document.createElement('input')
+  seek.type = 'range'; seek.min = '0'; seek.max = String(frames.length - 1); seek.value = '0'
+  seek.setAttribute('aria-label', '录像时间轴')
+  const download = evidenceText('a', '下载录像 AVI')
+  download.href = 'data:video/x-msvideo;base64,' + recording.base64
+  download.download = String(executionCode || 'dsl-debug').replace(/[^a-zA-Z0-9_-]/g, '_') + '.avi'
+  const label = evidenceText('p', '', 'muted')
+  const image = document.createElement('img')
+  image.alt = '执行器主桌面录屏'
+  image.className = 'execution-recording-frame'
+  let timer, playing = false, disposed = false, frameIndex = 0
+  const pause = () => { clearTimeout(timer); playing = false; play.textContent = '播放' }
+  const show = () => {
+    const frame = frames[frameIndex]
+    if (!Number.isSafeInteger(frame.offset) || !Number.isSafeInteger(frame.length) || frame.offset < 0 ||
+        frame.length < 1 || frame.offset + frame.length > binary.length) {
+      pause(); label.textContent = '录像画面数据不完整。'; return false
+    }
+    image.src = 'data:image/jpeg;base64,' + btoa(binary.slice(frame.offset, frame.offset + frame.length))
+    seek.value = String(frameIndex)
+    label.textContent = [(frame.elapsedMs / 1000).toFixed(1) + ' / ' + (recording.durationMs / 1000).toFixed(1) + ' 秒',
+      '主桌面', recording.fps + ' FPS', frame.flowCode, frame.stepCode,
+      reasons[recording.stopReason]].filter(Boolean).join(' · ')
+    return true
+  }
+  const advance = () => {
+    if (disposed || !playing) return
+    if (frameIndex >= frames.length - 1) { pause(); return }
+    const delay = Math.max(1, frames[frameIndex + 1].elapsedMs - frames[frameIndex].elapsedMs)
+    timer = setTimeout(() => { frameIndex++; if (show()) advance() }, delay)
+  }
+  play.onclick = () => {
+    if (playing) { pause(); return }
+    if (frameIndex === frames.length - 1) frameIndex = 0
+    playing = true; play.textContent = '暂停'
+    if (show()) advance()
+  }
+  seek.oninput = () => { pause(); frameIndex = Number(seek.value); show() }
+  controls.append(play, seek, download)
+  panel.append(controls, label, image)
+  show()
+  return () => { disposed = true; pause(); image.removeAttribute('src') }
+}
+
 function evidenceSnapshots(result) {
   const snapshots = Array.isArray(result.snapshots) ? result.snapshots : []
   const timeline = Array.isArray(result.DOMs) ? result.DOMs : []
@@ -101,8 +161,10 @@ async function showDebugExecutionDetails(sessionId, artifactId, initialTab = 'st
   panel.setAttribute('role', 'tabpanel')
   panel.tabIndex = 0
   const flow = current.dsl
-  const tabNames = [['dsl', 'DSL'], ['steps', '执行步骤'], ['ctx', 'CTX'], ['dom', 'DOM'], ['screenshots', '截图']]
+  const tabNames = [['dsl', 'DSL'], ['steps', '执行步骤'], ['ctx', 'CTX'], ['dom', 'DOM'], ['screenshots', '截图'], ['recording', '录屏']]
   let activeTab = initialTab, data, snapshots = [], snapshotIndex = 0, loading = 0
+  let releaseRecording = () => {}
+  dialog.addEventListener('close', () => releaseRecording(), { once: true })
   const buttons = tabNames.map(([key, label], index) => {
     const button = evidenceText('button', label)
     button.type = 'button'
@@ -124,6 +186,8 @@ async function showDebugExecutionDetails(sessionId, artifactId, initialTab = 'st
   dialog.append(controls, summary, tabs, panel)
 
   function render() {
+    releaseRecording()
+    releaseRecording = () => {}
     tabNames.forEach(([key], index) => {
       const selected = key === activeTab
       buttons[index].setAttribute('aria-selected', String(selected))
@@ -139,9 +203,11 @@ async function showDebugExecutionDetails(sessionId, artifactId, initialTab = 'st
       const dsl = data.dsl || result.dsl
       if (dsl) panel.append(createInlineJsonTree(dsl).root)
       else empty('这次执行未保存 DSL 快照。')
+    } else if (activeTab === 'recording') {
+      releaseRecording = showExecutionRecording(panel, result.recording, result.executionCode)
     } else if (activeTab === 'steps') {
-      const rows = debugExecutionResult.executionSteps(result).filter(row =>
-        ['SUCCEEDED', 'FAILED', 'CANCELLED', 'BRANCH'].includes(row.status))
+      const rows = debugExecutionResult.displaySteps(result, data.dsl || result.dsl).filter(row =>
+        ['SUCCEEDED', 'FAILED', 'IGNORED', 'CANCELLED', 'BRANCH'].includes(row.status))
       if (!rows.length) { empty('没有实际执行的步骤记录。'); return }
       table(panel, [
         { label: '步骤名称', format: row => row.stepName || row.stepCode },
@@ -153,11 +219,17 @@ async function showDebugExecutionDetails(sessionId, artifactId, initialTab = 'st
     } else {
       if (snapshots.length) {
         const phases = { INITIAL: '开始', BEFORE: '执行前', AFTER: '执行后', CHECKPOINT: '检查点', FAILURE: '失败', FINAL: '结束', BRANCH: '分支' }
-        const selection = evidencePicker('快照', snapshots.map((item, index) =>
-          [phases[item.phase] || item.phase || '快照 ' + (index + 1), item.stepName || item.stepCode].filter(Boolean).join(' · ')))
+        const selection = evidencePicker('快照', snapshots.map((item, index) => {
+          const phase = item.phase === 'POINT' ? '指定采证 · ' + phases[item.timing] : phases[item.phase] || item.phase
+          return [phase || '快照 ' + (index + 1), item.stepName || item.stepCode, item.phase === 'POINT' ? item.flowCode : null].filter(Boolean).join(' · ')
+        }))
         selection.picker.value = String(snapshotIndex)
         selection.picker.onchange = () => { snapshotIndex = Number(selection.picker.value); render(); panel.querySelector('select')?.focus() }
         panel.append(selection.wrapper)
+      }
+      if (result.unreachedCapturePoints?.length) {
+        empty('未到达采证点：' + result.unreachedCapturePoints.map(point =>
+          point.flowCode + ' / ' + point.stepCode + '（' + (point.timing === 'BEFORE' ? '执行前' : '执行后') + '）').join('、'))
       }
       const snapshot = snapshots[snapshotIndex] || result
       if (activeTab === 'ctx') {
@@ -203,7 +275,8 @@ async function showDebugExecutionDetails(sessionId, artifactId, initialTab = 'st
       data = evidence
       snapshots = evidenceSnapshots(data.result || {})
       const failure = snapshots.findLastIndex(item => item.phase === 'FAILURE')
-      const outcome = entry.conclusion || debugExecutionResult.conclusion(data.result || {}, entry.verification)
+      const result = data.result || {}
+      const outcome = debugExecutionResult.conclusion(result, debugExecutionResult.displaySteps(result, data.dsl || result.dsl))
       snapshotIndex = outcome.status === 'FAILED' && failure >= 0 ? failure : Math.max(0, snapshots.length - 1)
       const scopeLabel = { full: '当前完整 DSL', selected: '仅选中步骤', candidate: '候选 DSL', resume: '失败现场续跑' }[entry.executionScope]
       summary.textContent = [scopeLabel, outcome.content, entry.warning || data.warning].filter(Boolean).join(' · ')

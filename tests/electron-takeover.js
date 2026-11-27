@@ -59,7 +59,7 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
   await run('taskMonitor.elements.tableBody.querySelector(".task-links a").click()')
   const monitorPopup=await monitorOpened
   const mr=code=>monitorPopup.webContents.executeJavaScript(code,true)
-  await wait('$("designConnectDialog").open',mr)
+  await wait('$("designConnectDialog").open&&!$("designConnectExecutor").disabled',mr)
   await mr(`$("designConnectExecutor").value=${JSON.stringify(base)};$("designConnectForm").requestSubmit()`)
   await wait('managed.flows.length===1&&!$("designConnectDialog").open',mr)
   await mr('$("flowManagementTable").querySelector("td.actions button").click()')
@@ -87,12 +87,12 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
   const opened=new Promise(resolve=>app.once('browser-window-created',(_e,child)=>resolve(child)))
   await run(button+'.click()');popup=await opened
   const pr=code=>popup.webContents.executeJavaScript(code,true)
-  await wait('$("designConnectDialog").open',pr)
+  await wait('$("designConnectDialog").open&&!$("designConnectExecutor").disabled',pr)
   await pr(`$("designConnectExecutor").value=${JSON.stringify(base)};$("designConnectForm").requestSubmit()`)
   await wait('current?.scope.flowCode==="flow-A"&&document.documentElement.dataset.designReady==="true"',pr)
   assert.equal(await pr('$("flowServices").value'),'1')
   await wait('taskMonitor.allRows[0].taskComment==="Agent接管调试中"')
-  await wait('$("overviewTakeovers").textContent==="1/1"')
+  await wait('$("overviewTakeovers").textContent==="1"&&$("overviewTodayTakeovers").textContent==="1"')
   assert.equal(pauses,1)
   assert.match(await run('taskMonitor.elements.tableBody.textContent'),/已停用（Agent接管调试中）/)
   await wait('!taskLoading&&$("task").value==="task-A"&&$("task").disabled',pr)
@@ -103,7 +103,7 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
   assert.match(await pr('desktop.invoke("workspace:update",current.id,{taskCode:"task-B"}).catch(error=>error.message)'),/仅允许使用被接管/)
   await run(button+'.click()')
   assert.equal(BrowserWindow.getAllWindows().length,2)
-  assert.equal(await run('$("overviewTakeovers").textContent'),'1/1')
+  assert.equal(await run('$("overviewTakeovers").textContent'),'1')
   failRestore=true
   const restoreFailed=new Promise(resolve=>{
     dialog.showMessageBox=async (_win,options)=>{if(options?.message==='恢复申报户状态失败')resolve();return {response:1}}
@@ -116,7 +116,7 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
   setTimeout(()=>popup.close(),50)
   await closed
   await wait('taskMonitor.allRows[0].taskStatus==="已启用"&&taskMonitor.allRows[0].taskComment==="原备注"')
-  await wait('$("overviewTakeovers").textContent==="0/1"')
+  await wait('$("overviewTakeovers").textContent==="1"&&$("overviewTodayTakeovers").textContent==="1"')
   assert.equal(restores,1)
   status='已停用';comment='Agent接管调试中';await run('taskMonitor.refreshData()')
   assert.match(await run('desktop.invoke("monitor:account-takeover",{rowId:taskMonitor.allRows[0].id,serviceName:"增员"}).catch(error=>error.message)'),/已有旧接管标记/)

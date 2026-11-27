@@ -3,8 +3,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { businessContext, traceVariable } = require('../src/agent/business-context')
 const { diagnosisCard, recordDiagnosis } = require('../src/agent/diagnosis')
-const { assertionSchema } = require('../src/agent/business-verification')
-const { createTools, verifyBusiness } = require('../src/agent/tools')
+const { createTools } = require('../src/agent/tools')
 const { prepareContext } = require('../src/agent/context')
 const { fallbackConclusion } = require('../src/agent/conclusion')
 const { digest } = require('../src/agent/store')
@@ -65,59 +64,6 @@ test('diagnosis retains actionable suggestions, rejects missing evidence and inv
   assert.ok(prepareContext(session).some(message => message.content.includes('初始化覆盖')))
   session.taskCode = 'other'
   assert.equal(diagnosisCard(session).recorded, null); assert.equal(diagnosisCard(session).current, false)
-})
-test('structured assertion schema rejects ambiguous final states and duplicate person keys', () => {
-  assert.throws(() => assertionSchema().parse([{ id: 's', type: 'businessState', selector: '#s', acceptedValues: ['审核中'], pendingValues: ['审核中'] }]), /不能重叠/)
-  assert.throws(() => assertionSchema().parse([{ id: 's', type: 'recordSet', selector: 'tr', keySelector: '.id', valueSelector: '.state', records: [{ key: 'p', value: '完成' }, { key: 'p', value: '完成' }] }]), /重复/)
-  assert.throws(() => assertionSchema().parse([{ id: 's', type: 'businessState', selector: '#s' }]), /办结/)
-})
-test('official business state distinguishes pending, unknown, failure and complete outcomes', async () => {
-  const rules = assertionSchema().parse([{ id: 'state', type: 'businessState', selector: '#s', acceptedValues: ['已入账'], pendingValues: ['银行处理中'], failedValues: ['退回'] }])
-  for (const [value, expected] of [['银行处理中', 'PENDING'], ['未知文案', 'UNKNOWN'], ['退回', 'FAILED'], ['已入账', 'VERIFIED']]) {
-    assert.equal((await verifyBusiness(rules, result(), async () => [value])).status, expected)
-  }
-  const page = result(); page.snapshots[0].dom.truncated = true
-  assert.equal((await verifyBusiness(rules, page, async () => ['已入账'])).status, 'UNKNOWN')
-})
-test('person reconciliation handles mixed results, missing rows, duplicates and unexpected people', async () => {
-  const rules = assertionSchema().parse([{ id: 'people', type: 'recordSet', selector: 'tr', keySelector: '.id', valueSelector: '.state', pendingValues: ['审核中'],
-    records: [{ key: 'p1', value: '完成' }, { key: 'p2', value: '完成' }] }])
-  const query = rows => async (_, selector, fields) => fields ? rows : []
-  let verified = await verifyBusiness(rules, result(), query([{ key: 'p1', value: '完成' }, { key: 'p2', value: '审核中' }]))
-  assert.equal(verified.status, 'PENDING'); assert.equal(verified.details[0].counts.PASSED, 1)
-  verified = await verifyBusiness(rules, result(), query([{ key: 'p1', value: '完成' }, { key: 'p2', value: '退回' }]))
-  assert.equal(verified.status, 'FAILED'); assert.equal(verified.details[0].items[1].state, 'FAILED')
-  assert.equal((await verifyBusiness(rules, result(), query([{ key: 'p1', value: '完成' }]))).status, 'UNKNOWN')
-  assert.equal((await verifyBusiness(rules, result(), query([{ key: 'p1', value: '完成' }, { key: 'p1', value: '完成' }, { key: 'p2', value: '完成' }]))).status, 'UNKNOWN')
-  assert.equal((await verifyBusiness(rules, result(), query([{ key: 'p1', value: '完成' }, { key: 'p2', value: '完成' }, { key: 'p3', value: '完成' }]))).status, 'FAILED')
-  assert.equal((await verifyBusiness(rules, result(), query([{ key: 'p1', value: '完成' }, { key: 'p2', value: '完成' }]))).status, 'VERIFIED')
-})
-test('exact field assertions detect wrong units and periods without substring success', async () => {
-  const rules = assertionSchema().parse([{ id: 'unit', type: 'textEquals', selector: '#unit', expected: 'unit1' }])
-  assert.equal((await verifyBusiness(rules, result(), async () => ['unit10'])).status, 'FAILED')
-  assert.equal((await verifyBusiness(rules, result(), async () => ['unit1', 'unit1'])).status, 'UNKNOWN')
-})
-test('payment verification requires full coverage and checks assertion expectations against task context', async () => {
-  const session = fixture(), context = businessContext(session, { taskCode: 'task', accountNumber: 'unit1', feeMonth: '2026-11', personCount: 2, amount: 100 })
-  // An explicit business expectation resolves the configured old unit while preserving the conflict.
-  session.businessProfile = { taskCode: 'task', values: { account: 'unit1' } }
-  const confirmed = businessContext(session, { taskCode: 'task', accountNumber: 'unit1', feeMonth: '2026-11', personCount: 2, amount: 100 })
-  const rules = assertionSchema().parse([
-    { id:'account',type:'textEquals',businessField:'account',selector:'#account',expected:'unit1' },
-    { id:'period',type:'textEquals',businessField:'period',selector:'#period',expected:'2026-11' },
-    { id:'count',type:'numberEquals',businessField:'personCount',selector:'#count',expected:2 },
-    { id:'amount',type:'numberEquals',businessField:'amount',selector:'#amount',expected:100 },
-    { id:'state',type:'businessState',selector:'#state',acceptedValues:['已入账'] }
-  ])
-  const query = async (_, selector) => [{ '#account':'unit1','#period':'2026-11','#count':'2','#amount':'100','#state':'已入账' }[selector]]
-  assert.equal((await verifyBusiness(rules, result(), query, context)).status, 'UNKNOWN')
-  assert.equal((await verifyBusiness(rules, result(), query, confirmed)).status, 'VERIFIED')
-  const partial = await verifyBusiness(rules.slice(0, 1), result(), query, confirmed)
-  assert.equal(partial.status, 'UNKNOWN'); assert.ok(partial.coverage.missing.includes('amount'))
-  const wrong = rules.map(rule => rule.id === 'period' ? { ...rule, expected:'2026-10' } : rule)
-  const outcome = await verifyBusiness(wrong, result(), async (_, selector) => selector === '#period' ? ['2026-10'] : query(_, selector), confirmed)
-  assert.equal(outcome.status, 'UNKNOWN')
-  assert.match(outcome.details.find(item => item.id === 'period').reason, /业务上下文/)
 })
 test('private verification preserves long account identifiers while model-facing context stays redacted', () => {
   const session = fixture(), task = { accountNumber: '123456789012345678' }

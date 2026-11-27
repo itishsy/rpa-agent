@@ -6,6 +6,7 @@ const https = require('https')
 const DEFAULT_EXECUTOR_BASE_URL = 'http://localhost:9090'
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 const DEBUG_PATH = /^\/api\/robot\/debug\/runs(?:\/|\?|$)/
+const ACCOUNT_PATH = /^\/api\/robot\/task\/listAllTask(?:\?|$)/
 
 function debugAuthError(baseUrl, status, message = '') {
   const missing = /^调试访问令牌未配置[。！!]?$/.test(String(message).trim())
@@ -53,7 +54,7 @@ function request(baseUrl, options = {}) {
     'Content-Length': payload.length
   } : {}
   const debugToken = String(options.debugToken || '').trim()
-  if (debug) {
+  if (debug || (debugToken && ACCOUNT_PATH.test(requestPath))) {
     if (!debugToken) throw Object.assign(new Error('请在执行器管理中为当前连接保存调试令牌。执行器：' + normalized), { code: 'EXECUTOR_DEBUG_AUTH' })
     if (!/^[\x21-\x7e]+$/.test(debugToken)) {
       throw Object.assign(new Error('调试令牌包含空白或非 ASCII 字符，请重新复制完整令牌。'), { code: 'EXECUTOR_DEBUG_AUTH' })

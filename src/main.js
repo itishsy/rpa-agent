@@ -1,7 +1,8 @@
 'use strict'
 const {flowMetadata,stepMetadata}=require('./services/flow-metadata')
-const { app, BrowserWindow, ipcMain, Menu, dialog, safeStorage, session: electronSession, shell, clipboard, nativeImage } = require('electron')
+const { app, BrowserWindow, ipcMain, Menu, dialog, safeStorage, session: electronSession, shell, clipboard, nativeImage, screen, crashReporter } = require('electron')
 const fs = require('node:fs')
+const { atomicWriteFileSync } = require('./services/atomic-file')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { SessionStore, clone, digest } = require('./agent-core/store')
@@ -10,6 +11,8 @@ const { Harness } = require('./agents/development/agent')
 const {ExecutorLeases} = require('./agent-core/executor-leases')
 const {registerOperationsHandlers} = require('./ipc/operations-handlers')
 const {registerDevelopmentHandlers} = require('./ipc/development-handlers')
+const {registerEngineHandlers} = require('./ipc/engine-handlers')
+const {createCodexEngine} = require('./services/codex/engine')
 const {registerTakeoverHandlers} = require('./handoff/takeover-service')
 const { checkpoint, executorKey } = require('./agent-core/control')
 const { createTools, validateCandidate, toSaveRows } = require('./agents/development/tools')
@@ -23,21 +26,44 @@ const {normalizeExecutorAccounts}=require('./services/executor-accounts')
 const {createPatchWorkflow}=require('./services/patch-workflow')
 const control = require('./services/executor-control')
 const { completeChat } = require('./agent-core/model-client')
-const { buildDebugDsl, nestDebugSteps, loadReferencedDebugFlows } = require('./services/debug-dsl')
+const { buildDebugDsl, nestDebugSteps, createReferencedFlowReader, loadReferencedDebugFlows } = require('./services/debug-dsl')
 const { refreshUndeclaredData, analysisSourceKey } = require('./services/undeclared-monitor')
 const { buildTaskExport } = require('./services/undeclared-export')
 const { diagnosisCard } = require('./agents/development/diagnosis')
 const { createBusinessService } = require('./services/business')
 const { prepareMonitorSettings, publicMonitorSettings, migrateLegacyPayments } = require('./services/monitor-settings')
 const { validateAppearance, appearanceSnapshot } = require('./services/appearance')
+const { prepareDirectory, initializeCacheDirectory } = require('./services/cache-directory')
+const { persistLoginPreferences } = require('./services/login-preferences')
+const { disableTsfIme, createStartupRecorder, configureCrashReporter } = require('./services/windows-startup')
 const { nativeTheme } = require('electron')
 const {createUserAuth,DEFAULT_USER_API}=require('./services/user-auth')
 const userAuth=createUserAuth()
 
 app.setName('rpa-agent')
+// Some third-party Chinese TSF input methods crash Chromium while it is
+// creating its first text-input client. Fall back to the legacy IMM32 path.
+disableTsfIme(app.commandLine)
 require('electron').nativeTheme.themeSource = 'dark'
 // Separate from the older IDE, which already calls its data folder rpa-agent.
-app.setPath('userData', process.env.RPA_AGENT_TEST_DATA || path.join(app.getPath('appData'), 'rpa-agent-electron'))
+const { configuredDataDirectory, prepareDataDirectory, recoverDataDirectory } = require('./services/data-directory')
+const legacyDataDirectoryMarker = path.join(app.isPackaged ? path.dirname(process.execPath) : path.resolve(__dirname, '..'), 'rpa-agent-data.json')
+const explicitDataDirectory = process.env.RPA_AGENT_TEST_DATA || process.env.RPA_AGENT_DATA_DIR
+const lowDataDirectory = path.join(app.getPath('home'), 'AppData', 'LocalLow', 'rpa-agent-electron')
+const startupDataDirectory = process.platform === 'win32' ? lowDataDirectory + '-startup'
+  : path.join(app.getPath('appData'), 'rpa-agent-electron-startup')
+const dataDirectoryMarker = explicitDataDirectory
+  ? path.join(explicitDataDirectory, 'data-directory.json')
+  : path.join(startupDataDirectory, 'data-directory.json')
+let userDataDirectory = explicitDataDirectory || configuredDataDirectory(dataDirectoryMarker,
+  path.join(app.getPath('appData'), 'rpa-agent-electron'), legacyDataDirectoryMarker)
+const initialDataState = prepareDataDirectory({ directory: userDataDirectory, marker: dataDirectoryMarker,
+  fallbackDirectories: process.platform === 'win32' && !explicitDataDirectory ? [lowDataDirectory] : [] })
+userDataDirectory = initialDataState.directory
+app.setPath('userData', userDataDirectory)
+let recordStartup = createStartupRecorder(userDataDirectory)
+configureCrashReporter({ app, crashReporter, userDataDirectory, recordStartup })
+process.on('uncaughtExceptionMonitor', error => recordStartup(`uncaught exception: ${error?.stack || error}`))
 const root = path.join(__dirname, 'renderer')
 const windows = new Set()
 const sessions = new Map()
@@ -52,6 +78,8 @@ const workspaceOwners = new Map()
 const commandCache = new Map()
 
 let mainWindow, store, executionEvidence, harness, platforms, settings, mcp, mcpSessionId, businessWriting = false
+let cacheDirectory, cacheDirectoryWarning = ''
+let codexEngine
 const codec = {
   encrypt(value) {
     if (!safeStorage.isEncryptionAvailable()) throw new Error('系统安全存储不可用，无法保存凭据或会话')
@@ -69,8 +97,7 @@ function readSettings() {
 }
 function saveSettings() {
   const file = path.join(app.getPath('userData'), 'settings.enc')
-  fs.writeFileSync(file + '.tmp', codec.encrypt(JSON.stringify(settings)))
-  fs.renameSync(file + '.tmp', file)
+  atomicWriteFileSync(file, codec.encrypt(JSON.stringify(settings)))
 }
 function currentAppearance() {return appearanceSnapshot(settings.appearance,nativeTheme.shouldUseDarkColors)}
 function broadcastAppearance() {
@@ -136,6 +163,21 @@ async function robot(current, input) {
   return response && Object.hasOwn(response, 'data') ? response.data : response
 }
 async function api(current, input) { return userRequest(input,ensureIdentity(current.scope.platformId)) }
+function flowReadRecord(flow) {
+  const clean = flowMetadata(flow)
+  return flow?.relationFlowCode ? { ...clean, relationFlowCode: flow.relationFlowCode, readOnly: true } : clean
+}
+function nativeStepDigest(current, rows) {
+  const { appCode, flowCode } = current.scope
+  return digest(buildDebugDsl(appCode, flowCode, current.savedBaseline, rows, undefined, { draft: true }).steps)
+}
+function referencedFlowApi(current) {
+  return {
+    listFlows: appCode => adapters.flows({ ...current, scope: { ...current.scope, appCode } }),
+    getFlow: async code => flowReadRecord(await api(current, { path: 'robot/client/app/getByFlowCode/' + encodeURIComponent(code), body: {} })),
+    listSteps: flow => adapters.steps(current, flow)
+  }
+}
 const adapters = {
   async commands(current, codes = []) {
     const key = current.scope.platformId
@@ -160,7 +202,7 @@ const adapters = {
     }
     return { items, oldSteps: current.editorRows || [] }
   },
-  flows: async current => (await api(current, { path: 'robot/flow/list', body: { appCode: current.scope.appCode } })).map(flowMetadata),
+  flows: async current => (await api(current, { path: 'robot/flow/list', body: { appCode: current.scope.appCode } })).map(flowReadRecord),
   steps: async (current,input) => {
     const code=typeof input==='string'?input:input.flowCode
     const rows=await api(current,{path:'robot/flow/step/list/'+encodeURIComponent(code),params:{}})
@@ -186,10 +228,9 @@ const adapters = {
         baseline: digest(item.savedBaseline || null), businessProfile: digest(item.businessProfile || null), readOnly: !!item.readOnly, serverChanged: !!item.serverChanged }))
       .sort((a, b) => a.id.localeCompare(b.id))
   },
-  async bundle(current, dsl, { proposal = null,inspectionFlowCode,inspect=false } = {}) {
+  async bundle(current, dsl, { proposal = null,inspectionFlowCode,inspect=false,validate=true } = {}) {
     const bundle = await loadReferencedDebugFlows(dsl, current.scope.appCode, {
-      listFlows: () => adapters.flows(current),
-      listSteps: flow => adapters.steps(current,flow),
+      ...referencedFlowApi(current),
       overrideFlow(flow, owner) {
         if (owner !== current.scope.appCode || flow.readOnly) return null
         if (proposal?.targetFlowCode === flow.flowCode) return clone(proposal.dsl)
@@ -206,7 +247,7 @@ const adapters = {
         const rows = validateCandidate(target, definition, { ...commands, oldSteps: [] }, { execution: true })
         return buildDebugDsl(owner, flow.flowCode, definition, rows)
       }
-    },{inspect:inspect||!!inspectionFlowCode,targetFlowCode:inspectionFlowCode})
+    },{inspect:inspect||!!inspectionFlowCode,targetFlowCode:inspectionFlowCode,validate})
     if (proposal?.targetFlowCode) {
       const definition = bundle.subflows.find(flow => flow.flowCode === proposal.targetFlowCode)
       if (!definition) throw new Error('候选目标不再属于主流程调用范围')
@@ -251,22 +292,8 @@ const adapters = {
   },
   archiveExecution: (current, run, result, dsl) => executionEvidence.record(current.scope, run, result, dsl),
   execute: (current, body, signal) => { checkpoint(signal); return robot(current, { path: '/api/robot/debug/runs', method: 'POST', body }) },
-  continue: (current, previous, dsl, signal) => { checkpoint(signal); return robot(current, { path: '/api/robot/debug/runs/' + encodeURIComponent(previous.result.executionCode) + '/continue', method: 'POST',
-    body: { stepCode: previous.result.failedStepCode, dsl, ctx: true, dom: true, screenshot: true } }) },
-  async query(content, selector, fields) {
-    if (!mainWindow || mainWindow.isDestroyed()) return null
-    // DOMParser creates an inert document: no navigation, scripts or image requests.
-    return mainWindow.webContents.executeJavaScript(`(() => {
-      const fields = ${JSON.stringify(fields || null)};
-      return Array.from(new DOMParser().parseFromString(${JSON.stringify(content)}, 'text/html').querySelectorAll(${JSON.stringify(selector)})).map(node => {
-        if (!fields) return node.textContent;
-        return Object.fromEntries(Object.entries(fields).map(([key, selector]) => {
-          const cells = node.querySelectorAll(selector);
-          return [key, cells.length === 1 ? cells[0].textContent : null];
-        }));
-      });
-    })()`)
-  },
+  continue: (current, previous, dsl, signal, recording) => { checkpoint(signal); return robot(current, { path: '/api/robot/debug/runs/' + encodeURIComponent(previous.result.executionCode) + '/continue', method: 'POST',
+    body: { stepCode: previous.result.failedStepCode, dsl, ctx: true, dom: true, screenshot: true, retainFailureContext: false, ...(recording ? { recording } : {}) } }) },
   async htmlEvidence(content,options) {
     if(!mainWindow||mainWindow.isDestroyed())throw new Error('本地页面解析器不可用，请重新打开工作台')
     return mainWindow.webContents.executeJavaScript('('+inspectHtmlDocument.toString()+')('+JSON.stringify(content)+','+JSON.stringify(options)+')')
@@ -313,7 +340,7 @@ function trusted(event) {
 function handle(name, callback) {
   ipcMain.handle(name, (event, ...args) => {
     const owner = trusted(event)
-    if (owner.restoringAccount && ['agent:start', 'workspace:run', 'workspace:open'].includes(name)) {
+    if (owner.restoringAccount && ['agent:start', 'workspace:run', 'workspace:open', 'workspace:reload'].includes(name)) {
       throw new Error('正在恢复接管账户，请稍候')
     }
     return callback(...args, event)
@@ -321,7 +348,17 @@ function handle(name, callback) {
 }
 function openPage(name = 'index.html', options = {}) {
   const mainShell=name==='index.html'&&!options.designApp
-  const win = new BrowserWindow({ width: 1500, height: 940, minWidth: 1040, minHeight: 700, title: options.title || 'rpa-agent', backgroundColor:currentAppearance().resolvedTheme==='dark'?'#1c1c1e':'#f5f5f7',
+  const size = { width: 1500, height: 940, minWidth: 1040, minHeight: 700 }
+  if (options.designApp) {
+    const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea
+    const width = Math.min(1040, area.width)
+    const height = Math.min(760, area.height)
+    Object.assign(size, {
+      width, height, minWidth: Math.min(size.minWidth, width), minHeight: Math.min(size.minHeight, height),
+      x: area.x + Math.floor((area.width - width) / 2), y: area.y + Math.floor((area.height - height) / 2)
+    })
+  }
+  const win = new BrowserWindow({ ...size, title: options.title || 'rpa-agent', backgroundColor:currentAppearance().resolvedTheme==='dark'?'#1c1c1e':'#f5f5f7',
     icon:path.join(__dirname,'assets/app.png'),
     ...(mainShell?{titleBarStyle:'hidden',titleBarOverlay:{color:currentAppearance().resolvedTheme==='dark'?'#242426':'#ececef',symbolColor:currentAppearance().resolvedTheme==='dark'?'#f5f5f7':'#1d1d1f',height:36}}:{}),
     ...(options.designApp ? {modal:false,show:false} : {}),
@@ -350,6 +387,8 @@ function openPage(name = 'index.html', options = {}) {
   win.designExecutor=options.executor||'';win.designTakeover=options.takeover||null
   win.localPage = new URL(pathToFileURL(path.join(root, name)).href).pathname
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  win.webContents.on('did-fail-load', (_event, code, description, url) => recordStartup(`renderer load failed (${code}): ${description} ${url}`))
+  win.webContents.on('render-process-gone', (_event, details) => recordStartup(`renderer process gone: ${details.reason} exit=${details.exitCode}`))
   win.webContents.on('will-navigate', event => event.preventDefault())
   win.webContents.on('will-attach-webview', event => event.preventDefault())
   const ownerId=win.webContents.id
@@ -404,6 +443,24 @@ function registerIpc() {
     } catch(error) { return {error:error.message} }
   }
   const savingWorkspaces = new Set()
+  function readWorkspaceApplication(current) {
+    return api(current, { path: 'robot/app/page', body: { page: 1, start: 0, size: 100,
+      query: [{ property: 'appCode', value: current.scope.appCode }] } })
+  }
+  async function readWorkspaceDefinition(current, flow, appPage, owner, fallbackAppName) {
+    const { appCode, flowCode } = current.scope
+    const rows = nestDebugSteps(await createReferencedFlowReader(referencedFlowApi(current)).stepsOf(flow))
+    const apps = Array.isArray(appPage) ? appPage : appPage?.rows || appPage?.records || appPage?.list || []
+    const application = apps.find(item => item.appCode === appCode)
+    const windowApplication = owner?.designApplication?.appCode === appCode ? owner.designApplication : null
+    const appName = [application?.appName, windowApplication?.appName, fallbackAppName, flow.appName]
+      .map(name => typeof name === 'string' ? name.trim() : '')
+      .find(name => name && name !== appCode)
+    const metadata = { ...windowApplication, ...application, ...flow, appName,
+      appArgs: application?.appArgs ?? windowApplication?.appArgs ?? flow.appArgs }
+    const dsl = buildDebugDsl(appCode, flowCode, metadata, rows, undefined, { draft: true })
+    return { rows, appName, dsl, readOnly: flow.readOnly === true }
+  }
   handle('design:ready',event=>{
     const win=BrowserWindow.fromWebContents(event.sender)
     if(!win?.designApp)throw new Error('仅流程设计窗口可通知加载完成')
@@ -439,10 +496,9 @@ function registerIpc() {
     if(userAuth.pending)throw new Error('正在登录，请稍候')
     assertIdle();invalidateUserSession()
     const user=await userAuth.login(input)
-    const previous=settings.userLogin
-    settings.userLogin={baseUrl:user.baseUrl,username:user.username,...(input.rememberPassword===true?{rememberPassword:true,password:String(input.password)}:{})}
-    try{saveSettings()}catch(error){settings.userLogin=previous;invalidateUserSession();throw error}
-    broadcastUser();return user
+    const preferences=persistLoginPreferences({settings,user,rememberPassword:input.rememberPassword,password:input.password,save:saveSettings})
+    if(!preferences.saved)recordStartup(`login preferences not saved: ${preferences.error.message}`)
+    broadcastUser();return {...user,settingsWarning:preferences.warning}
   })
   handle('auth:logout',()=>{assertIdle();invalidateUserSession();return true})
   handle('app:bootstrap', event => ({ name: 'rpa-agent', version: app.getVersion(), designTakeover:BrowserWindow.fromWebContents(event.sender)?.designTakeover, designExecutor:BrowserWindow.fromWebContents(event.sender)?.designExecutor, designApplication:BrowserWindow.fromWebContents(event.sender)?.designApplication, designTaskName:BrowserWindow.fromWebContents(event.sender)?.designTaskName, designServiceItem:BrowserWindow.fromWebContents(event.sender)?.designServiceItem, designInitialFlowCode:BrowserWindow.fromWebContents(event.sender)?.designInitialFlowCode, platforms: [], platformId: activeUserId(), executorPlatformId:'',user:userAuth.status(),
@@ -495,7 +551,14 @@ function registerIpc() {
         !current.readOnly && digest(current.dsl) !== digest(current.savedBaseline))) throw new Error('该应用有未保存的步骤草稿，请先保存再同步生产')
     }
     const write = service.isWrite(name)
-    if (write) { assertIdle(); businessWriting = true }
+    if (write) {
+      if (name === 'releaseToProduction') {
+        if (businessWriting) throw new Error('正在保存业务配置或同步生产，请稍后重试')
+      } else {
+        assertIdle()
+      }
+      businessWriting = true
+    }
     try {
       const result = await service.invoke(name, input)
       if (name === 'releaseToProduction' && userAuth.isCurrent(identity)) {
@@ -578,9 +641,31 @@ function registerIpc() {
     broadcastAppearance()
     return currentAppearance()
   })
-  handle('settings:get', () => {ensureIdentity(activeUserId());return ({ ...settings, accountTakeoverTotals:undefined, modelApiKey: '', localDebugToken: '', hasModelApiKey: !!settings.modelApiKey, hasLocalDebugToken: !!settings.localDebugToken,
+  handle('settings:get', () => {ensureIdentity(activeUserId());return ({ ...settings, accountTakeoverTotals:undefined, accountTakeoverDaily:undefined, modelApiKey: '', localDebugToken: '', hasModelApiKey: !!settings.modelApiKey, hasLocalDebugToken: !!settings.localDebugToken,
     userLogin:settings.userLogin?{baseUrl:settings.userLogin.baseUrl,username:settings.userLogin.username,rememberPassword:!!settings.userLogin.rememberPassword}:undefined,
     connections: settings.connections.map(item => ({ baseUrl: item.baseUrl, runtimeUrl: item.runtimeUrl, serviceName: item.serviceName||'', debugToken: '', hasDebugToken: !!item.debugToken })), monitor: undefined })})
+  handle('cache:get', () => {
+    ensureIdentity(activeUserId())
+    const defaultDirectory=app.getPath('userData')
+    return { directory: cacheDirectory, configuredDirectory: settings.cacheDirectory || defaultDirectory,
+      defaultDirectory, warning: cacheDirectoryWarning }
+  })
+  handle('cache:choose', async event => {
+    ensureIdentity(activeUserId())
+    const result=await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
+      title:'选择缓存目录',defaultPath:settings.cacheDirectory || cacheDirectory,properties:['openDirectory','createDirectory']
+    })
+    return result.canceled ? null : result.filePaths[0]
+  })
+  handle('cache:save', async value => {
+    const identity=ensureIdentity(activeUserId())
+    const directory=await prepareDirectory(value, app.getPath('userData'), cacheDirectory)
+    if(!userAuth.isCurrent(identity))throw new Error('登录用户已变化')
+    const previous=settings.cacheDirectory
+    settings.cacheDirectory=directory
+    try { saveSettings() } catch(error) { settings.cacheDirectory=previous; throw error }
+    return { directory, restartRequired:path.relative(cacheDirectory,directory)!=='' }
+  })
   handle('settings:save', async input => {
     ensureIdentity(activeUserId())
     assertIdle(); await closeMcp()
@@ -605,12 +690,36 @@ function registerIpc() {
   handle('executor:service-name',async baseUrl=>{
     const identity=ensureIdentity(activeUserId())
     const selected=connection({scope:{executor:executor.normalizeBaseUrl(baseUrl)}})
-    if(!settings.remoteEnabled || (selected.debugToken?.length||0)<16)return selected.serviceName||''
-    let status
-    try { status=await require('./services/runtime-control').request(selected,'/api/agent/status') }
-    catch (_) { status=null }
-    if(!userAuth.isCurrent(identity))return ''
-    return (typeof status?.platformName==='string'?status.platformName.trim().slice(0,80):'')||selected.serviceName||''
+    const service=await require('./services/runtime-control').readServiceName(selected)
+    if(!userAuth.isCurrent(identity))throw new Error('登录用户已变化')
+    return service
+  })
+  handle('executor:management', async baseUrl => {
+    const identity=ensureIdentity(activeUserId())
+    const runtime=require('./services/runtime-control')
+    const selected=connection({scope:{executor:executor.normalizeBaseUrl(baseUrl)}})
+    const result=await runtime.request({...selected,runtimeUrl:runtime.runtimeUrl(selected,true)},'/api/agent/platforms')
+    if(!userAuth.isCurrent(identity))throw new Error('登录用户已变化')
+    return result
+  })
+  handle('executor:manage', async (baseUrl,input) => {
+    const identity=ensureIdentity(activeUserId())
+    if(!input||!['start','stop','switch'].includes(input.action))throw new Error('未知执行器管理操作')
+    assertIdle()
+    const runtime=require('./services/runtime-control')
+    const selected=connection({scope:{executor:executor.normalizeBaseUrl(baseUrl)}})
+    const target={...selected,runtimeUrl:runtime.runtimeUrl(selected,true)}
+    businessWriting=true
+    try{
+      const before=await runtime.request(target,'/api/agent/platforms')
+      if(!userAuth.isCurrent(identity))throw new Error('登录用户已变化')
+      if(typeof input.machineCode!=='string'||before.machineCode!==input.machineCode)throw new Error('目标设备已变化，请刷新执行器状态')
+      if(input.action==='switch'&&!before.platforms?.some(item=>item.id===input.platformId))throw new Error('后台服务已变化，请刷新后重新选择')
+      return await runtime.request(target,'/api/agent/control',{
+        requestId:require('node:crypto').randomUUID(),machineCode:before.machineCode,action:input.action,
+        ...(input.action==='switch'?{platformId:input.platformId}:{})
+      })
+    }finally{businessWriting=false}
   })
   handle('executor:control', async (action, platformId) => {
     ensureIdentity(activeUserId())
@@ -623,9 +732,8 @@ function registerIpc() {
     await platforms.exclusive(() => activatePlatform({ stop: control.stop, authenticate: () => {const active=ensureIdentity(identity.id);if(active!==identity)throw new Error('登录用户已变化，请重试');return active},
       writeConfig: identity => {
         const content = fs.readFileSync(config, 'utf8')
-        fs.writeFileSync(config + '.tmp', updateProperties(content, { 'rpa.server': identity.url, 'rpa.token': identity.token,
+        atomicWriteFileSync(config, updateProperties(content, { 'rpa.server': identity.url, 'rpa.token': identity.token,
           'rpa.ide-platform-id': identity.id, 'rpa.ide-platform-username': identity.username, custId: identity.custId || '', custName: identity.custName || '' }))
-        fs.renameSync(config + '.tmp', config)
       }, start: () => control.start(settings.localDebugToken), onStarted() {} }, identity.id))
     return { text: '已启动' }
   })
@@ -662,7 +770,7 @@ function registerIpc() {
     const stub = { scope }
     const [flows,appPage,commandData] = await Promise.all([
       adapters.flows(stub),
-      api(stub, { path: 'robot/app/page', body: { page: 1, start: 0, size: 100, query: [{ property: 'appCode', value: scope.appCode }] } }),
+      readWorkspaceApplication(stub),
       adapters.commands(stub)
     ])
     ensureIdentity(scope.platformId)
@@ -675,20 +783,10 @@ function registerIpc() {
       if(existing)return {session:sessionSnapshot(existing),commands:commandData.items,tasks:[],tasksPending:true}
     }else flow = flows.find(item => item.flowCode === scope.flowCode)
     if (!flow) throw new Error('流程不属于当前应用')
-    const rows = nestDebugSteps(await adapters.steps(stub,flow))
-    // Application metadata supplies appArgs required by executor context initialisation.
-    const apps = Array.isArray(appPage) ? appPage : appPage?.rows || appPage?.records || appPage?.list || []
-    const application = apps.find(item => item.appCode === scope.appCode)
-    const windowApplication = owner.designApplication?.appCode === scope.appCode ? owner.designApplication : null
-    const appName = [application?.appName, windowApplication?.appName, source?.appName, flow.appName]
-      .map(name => typeof name === 'string' ? name.trim() : '')
-      .find(name => name && name !== scope.appCode)
-    const metadata = { ...windowApplication, ...application, ...flow, appName,
-      appArgs: application?.appArgs ?? windowApplication?.appArgs ?? flow.appArgs }
-    const dsl = buildDebugDsl(scope.appCode,scope.flowCode,metadata,rows,undefined,{draft:true})
+    const { rows, appName, dsl, readOnly } = await readWorkspaceDefinition(stub, flow, appPage, owner, source?.appName)
     const current = store.create(scope, dsl)
     current.appName = appName
-    current.readOnly = flow.readOnly===true
+    current.readOnly = readOnly
     if(source)current.taskCode=source.taskCode||''
     if (owner.designAccountTakeover) {
       current.takeoverTaskCode = owner.designAccountTakeover.taskCode
@@ -705,6 +803,37 @@ function registerIpc() {
     store.save(current)
     const accounts=input.deferTasks?{tasks:[]}:await loadWorkspaceAccounts(current)
     return { session: sessionSnapshot(current), tasks: accounts.tasks||{error:accounts.error}, tasksPending:!!input.deferTasks, commands: commandData.items }
+  })
+  handle('workspace:reload', async (id, uncommitted, event) => {
+    const current = requireSession(id)
+    const unchanged = () => {
+      if (requireSession(id) !== current || workspaceOwners.get(id) !== event.sender.id) throw new Error('请在对应流程窗口刷新')
+      if (businessWriting || savingWorkspaces.has(id) || productionRuns.has(id) || harness.active.has(id)) {
+        throw new Error('请在当前操作结束后刷新流程')
+      }
+    }
+    unchanged()
+    const { revision, savedBaseline, proposal, turn, operation } = current
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    if (uncommitted === true || proposal || digest(current.dsl) !== digest(savedBaseline)) {
+      const result = await dialog.showMessageBox(owner, {
+        type: 'warning', title: '刷新当前流程', message: '放弃当前流程的未保存修改和候选补丁？',
+        detail: '刷新将从服务器重新加载步骤，并重新读取执行器上的申报账户。',
+        buttons: ['取消', '放弃并刷新'], defaultId: 0, cancelId: 0
+      })
+      if (result.response !== 1) return null
+    }
+    const [flows, appPage] = await Promise.all([adapters.flows(current), readWorkspaceApplication(current)])
+    const flow = flows.find(item => item.flowCode === current.scope.flowCode)
+    if (!flow) throw new Error('流程已不存在或不属于当前应用')
+    const { rows, appName, dsl, readOnly } = await readWorkspaceDefinition(current, flow, appPage, owner, current.appName)
+    unchanged()
+    if (current.revision !== revision || current.savedBaseline !== savedBaseline || current.proposal !== proposal ||
+        current.turn !== turn || current.operation !== operation) throw new Error('刷新期间会话已变化，请重试')
+    Object.assign(current, { editorRows: rows, appName, dsl, readOnly, savedBaseline: clone(dsl), savedServerStepDigest: undefined,
+      serverChanged: false, proposal: null, revision: revision + 1 })
+    store.save(current)
+    return sessionSnapshot(current)
   })
   handle('workspace:tasks',async (id,event)=>{
     const current=requireSession(id)
@@ -800,7 +929,7 @@ function registerIpc() {
   handle('workspace:paste-preview', (id, input) => {
     const current = requireSession(id)
     if (harness.active.has(id) || current.readOnly) throw new Error('当前流程不可编辑')
-    return require('./services/step-edit').importRecordedSteps(current.dsl, { steps: [input.step] }, input)
+    return require('./services/step-edit').importRecordedSteps(current.dsl, { steps: [input.step] }, { ...input, flattenOrdinaryChildren: true })
   })
   handle('workspace:argument-image', async id => {
     requireSession(id)
@@ -815,6 +944,7 @@ function registerIpc() {
   })
   handle('workspace:update', async (id, input) => {
     const current = requireSession(id)
+    if (savingWorkspaces.has(id)) throw new Error('正在保存步骤，请稍后修改')
     if(productionRuns.has(id))throw new Error('运行期间不能修改流程或账户')
     if (harness.active.has(id)) throw new Error('运行期间不能修改流程或账户')
     if (current.readOnly && Object.hasOwn(input,'dsl')) throw new Error('只读流程只读，不能直接修改步骤；可选择账户运行调试并生成建议补丁')
@@ -827,6 +957,8 @@ function registerIpc() {
     if (input.taskCode !== undefined) {
       if (current.takeoverTaskCode && input.taskCode && input.taskCode !== current.takeoverTaskCode) throw new Error('接管窗口仅允许使用被接管的申报户')
       if (input.taskCode!==''&&!(await adapters.tasks(current)).some(item => item.taskCode === input.taskCode)) throw new Error('账户不属于当前应用')
+      if (requireSession(id) !== current || productionRuns.has(id) || harness.active.has(id)) throw new Error('运行期间不能修改流程或账户')
+      accountLoadRequests.delete(current)
       current.taskCode = input.taskCode
       current.accountSelectionSet = true
     }
@@ -878,11 +1010,19 @@ function registerIpc() {
     savingWorkspaces.add(id)
     try {
       const raw = await adapters.steps(current,current.scope.flowCode)
-      const baseline = raw.length ? buildDebugDsl(current.scope.appCode, current.scope.flowCode, current.savedBaseline, nestDebugSteps(raw),undefined,{draft:true}) : { ...current.savedBaseline, steps: [] }
-      if (digest(baseline) !== digest(current.savedBaseline)) throw new Error('服务器步骤已被修改，请重新打开并合并变更')
+      const rows = nestDebugSteps(raw)
+      const serverStepDigest = nativeStepDigest(current, rows)
+      if (serverStepDigest !== (current.savedServerStepDigest ?? digest(current.savedBaseline.steps))) {
+        throw new Error('服务器步骤已被修改，请重新打开并合并变更')
+      }
       const codes = []; const visit = steps => steps.forEach(step => { codes.push(step.actionCode); visit(step.body || step.children || []) }); visit(current.dsl.steps)
-      await api(current, { path: 'robot/flow/step/save', params: { flowCode: current.scope.flowCode }, body: toSaveRows(current, await adapters.commands(current, codes)) })
-      for (const parent of current.editorRows || []) for (const row of [parent, ...(parent.list || [])]) delete row.sourceStepCode
+      const commands = await adapters.commands(current, codes)
+      const submitted = toSaveRows(current, { ...commands, oldSteps: rows })
+      const submittedRows = nestDebugSteps(submitted)
+      const submittedDigest = nativeStepDigest(current, submittedRows)
+      await api(current, { path: 'robot/flow/step/save', params: { flowCode: current.scope.flowCode }, body: submitted })
+      current.editorRows = submittedRows
+      current.savedServerStepDigest = submittedDigest
       current.savedBaseline = clone(current.dsl); current.serverChanged = false
       harness.event(current, 'workspace/saved', { revision: current.revision, message: '配置已保存；保存不代表业务验证通过' }); return current
     } finally { savingWorkspaces.delete(id) }
@@ -924,7 +1064,10 @@ function registerIpc() {
     })
   }
   handle('workspace:run',runSavedFlow)
-  registerDevelopmentHandlers({handle,takeovers,productionRuns,getState:()=>({settings,businessWriting}),requireSession,runSavedFlow,attachHtml,
+  registerEngineHandlers({handle,ensureUser:()=>ensureIdentity(activeUserId()),assertIdle,getSettings:()=>settings,saveSettings,getCacheDirectory:()=>cacheDirectory,
+    broadcast:value=>{for(const win of windows)if(!win.isDestroyed())win.webContents.send('engine:changed',value)}})
+  registerDevelopmentHandlers({handle,takeovers,productionRuns,getState:()=>({settings,businessWriting}),requireSession,runSavedFlow,readAccounts:adapters.tasks,attachHtml,
+    startCodex:(current,request,options)=>codexEngine.start(current,request,options),
     attachFile:(current,input)=>attachFile(current,input,harness,nativeImage),harness,connection,control,sessionSnapshot})
   handle('mcp:control', async (id, enabled) => {
     const current = requireSession(id)
@@ -977,7 +1120,7 @@ function registerIpc() {
     monitorSnapshot={identity,at:Date.now(),rows:new Map(result.rows.map(row=>[row.id,clone(row)]))}
     return { ...result, analysisSnapshot:monitorSnapshot.at }
   })
-  registerOperationsHandlers({handle,ensureIdentity,activeUserId,userAuth,getSettings:()=>settings,getSnapshot:()=>monitorSnapshot,monitorAnalysisRuns,createStore:()=>new SessionStore(path.join(app.getPath('userData'),'task-analysis'),codec)})
+  registerOperationsHandlers({handle,ensureIdentity,activeUserId,userAuth,getSettings:()=>settings,getSnapshot:()=>monitorSnapshot,monitorAnalysisRuns,createStore:()=>new SessionStore(path.join(cacheDirectory,'task-analysis'),codec)})
   handle('undeclared:export', async input => {
     const identity=ensureIdentity(activeUserId())
     const output = buildTaskExport(input)
@@ -989,24 +1132,51 @@ function registerIpc() {
 }
 async function closeMcp() { if (mcp) { const previous = mcp; mcp = null; mcpSessionId = null; await previous.stop() } }
 
-app.whenReady().then(() => {
-  fs.mkdirSync(app.getPath('userData'), { recursive: true })
+app.whenReady().then(async () => {
+  recordStartup(`application ready; TSF IME disabled=${process.platform === 'win32'}`)
+  const dataState = await recoverDataDirectory({ directory: userDataDirectory, marker: dataDirectoryMarker, dialog })
+  userDataDirectory = dataState.directory
+  app.setPath('userData', userDataDirectory)
+  recordStartup = createStartupRecorder(userDataDirectory)
   settings = readSettings()
+  const previousDataDirectory = dataState.previousDirectory || initialDataState.previousDirectory || (!explicitDataDirectory && fs.existsSync(dataDirectoryMarker)
+    ? JSON.parse(fs.readFileSync(dataDirectoryMarker, 'utf8')).previousDirectory : '')
+  if (previousDataDirectory) {
+    settings.cacheActiveDirectory = settings.cacheActiveDirectory || previousDataDirectory
+    settings.cacheDirectory = userDataDirectory
+  }
+  const cacheOverride = String(process.env.RPA_AGENT_CACHE_DIR || '').trim()
+  if (cacheOverride) {
+    const directory = path.resolve(cacheOverride)
+    settings.cacheDirectory = directory
+    settings.cacheActiveDirectory = directory
+  }
+  const initialCacheState = await initializeCacheDirectory(settings, app.getPath('userData'), saveSettings)
+  const cacheState = await require('./services/cache-recovery').recoverCacheDirectory({
+    state: initialCacheState, settings, defaultDirectory: app.getPath('userData'), persist: saveSettings, dialog
+  })
+  cacheDirectory = cacheState.directory
+  cacheDirectoryWarning = cacheState.warning
+  if (previousDataDirectory && !cacheState.warning) {
+    saveSettings()
+    atomicWriteFileSync(dataDirectoryMarker, JSON.stringify({ directory: userDataDirectory }))
+  }
   settings.appearance=validateAppearance(settings.appearance)
   nativeTheme.themeSource=settings.appearance.mode
   nativeTheme.on('updated',broadcastAppearance)
   const { createLongforAuth } = require('./services/longfor-auth')
   platforms = createPlatformService({ filePath: path.join(app.getPath('userData'), 'platform-accounts.json'), safeStorage,
     defaults: () => [], longforAuth: createLongforAuth(partition => electronSession.fromPartition(partition)) })
-  store = new SessionStore(path.join(app.getPath('userData'), 'sessions'), codec)
-  executionEvidence = new ExecutionEvidence(path.join(app.getPath('userData'), 'execution-evidence'), codec, store)
+  store = new SessionStore(path.join(cacheDirectory, 'sessions'), codec)
+  executionEvidence = new ExecutionEvidence(path.join(cacheDirectory, 'execution-evidence'), codec, store)
   harness = new Harness({ store, registry: createTools(adapters),leases:executorLeases,nativeRuns:productionRuns,
     complete: (input, signal, context) => completeChat(
       {...settings,modelName:context?.modelName||settings.modelName}, settings.modelApiKey,
-      addImageParts(input,context?.session,context?.imageIds,harness), fetch, signal),
+      addImageParts(input,context?.session,context?.imageIds,harness,context?.evidenceImages), fetch, signal),
     emit: event => { for (const win of windows) if (!win.isDestroyed() && event.sessionId && sessions.get(event.sessionId)?.scope.platformId === activeUserId()) win.webContents.send('agent:event', event) },
     cancelExecution: (current, context) => robot(current, { path: '/api/robot/debug/runs/active/cancel', method: 'POST',
       timeout: 15000, body: { appCode: current.scope.appCode, flowCode: current.scope.flowCode, taskCode: context?.taskCode || current.taskCode } }) })
+  codexEngine = createCodexEngine({runner:harness,getSettings:()=>settings.agentEngine||{},getCacheDirectory:()=>cacheDirectory})
   for (const unfinished of store.unfinished()) harness.recover(unfinished)
   registerIpc()
   mainWindow = openPage()
@@ -1017,7 +1187,11 @@ app.whenReady().then(() => {
     { label: '帮助', submenu: [{label:'关于 rpa-agent',click:()=>dialog.showMessageBox(mainWindow,{type:'info',title:'rpa-agent',message:'rpa-agent '+app.getVersion(),detail:'RPA 流程开发与任务监控工作台'})}] }
   ]))
   mainWindow.setMenu(null)
-}).catch(error => { dialog.showErrorBox('rpa-agent 启动失败', error.message); app.quit() })
+}).catch(error => {
+  recordStartup(`startup failed: ${error?.stack || error}`)
+  dialog.showErrorBox('rpa-agent 启动失败', error.message)
+  app.quit()
+})
 app.on('before-quit', event => {
   if (!busy()) { closeMcp().catch(() => {}); return }
   event.preventDefault()

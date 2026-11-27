@@ -1,5 +1,5 @@
 'use strict'
-const {app,BrowserWindow,dialog,Menu}=require('electron')
+const {app,BrowserWindow,dialog,Menu,screen}=require('electron')
 app.disableHardwareAcceleration()
 const fs=require('node:fs'),path=require('node:path'),http=require('node:http'),assert=require('node:assert/strict')
 const artifacts=path.resolve(__dirname,'../artifacts');fs.mkdirSync(artifacts,{recursive:true})
@@ -8,8 +8,10 @@ let decision=0,confirmations=0,failAccounts=false,failDelete=false,failOrder=fal
 let holdFirstFlowList=true,releaseFirstFlowList
 let holdAccounts=false,releaseAccounts
 let badConnectStatus=false
+let runtimeStatusError=0
 let releaseProduction,productionResponse='success',stoppedExecutor=false
 let failProductionSync=false
+let finishAgentResponse
 const performanceMetrics={}
 const childRows=[{stepCode:'child-page',stepName:'子流程访问网页',actionCode:'page',actionArgs:'{"url":"https://example.test/child"}',targetArgs:'{}',level:0,number:0}]
 const publicTemplates=[{flowCode:'public-flow',flowName:'公共引用流程',flowType:2}]
@@ -33,9 +35,16 @@ const servers=[0,1].map(index=>http.createServer(async(req,res)=>{
     const u=new URL(req.url,'http://mock'),p=u.pathname;let data
     const body=raw&&req.headers['content-type']?.includes('application/json')?JSON.parse(raw):{}
     requests.push({server:index,path:p,method:req.method,body,params:Object.fromEntries(u.searchParams)})
-    if(p==='/api/agent/status'){
+    if(p==='/api/agent/status'||p==='/virwin/p/28003/19090/api/agent/status'){
       assert.equal(req.headers['x-rpa-debug-token'],'offline-runtime-token')
-      res.end(JSON.stringify({platformName:'万科'}));return
+      if(runtimeStatusError){res.writeHead(runtimeStatusError);res.end('Runtime unavailable');return}
+      res.end(JSON.stringify({platformName:index?'龙湖':'万科'}));return
+    }
+    if(p.endsWith('/chat/completions')){
+      await new Promise(resolve=>{finishAgentResponse=resolve})
+      res.setHeader('Content-Type','application/json')
+      res.end(JSON.stringify({choices:[{message:{role:'assistant',content:'分析完成'},finish_reason:'stop'}]}))
+      return
     }
     if(p.endsWith('/oauth/token'))data={access_token:'test-token',custId:1,custName:'验收客户',expires_in:3600}
     else if(p.endsWith('/sys/user/menu/listMenuByUser/1'))data={menus:[],tabs:[],buttons:[]}
@@ -106,12 +115,12 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
   let popup
   try{
     await Promise.all(servers.map(server=>new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))))
-    const endpoints=servers.map((server,index)=>'http://127.0.0.1:'+server.address().port+(index?'/virwin/p/28003':''))
+    const endpoints=servers.map((server,index)=>'http://127.0.0.1:'+server.address().port+(index?'/virwin/p/28003/9090':''))
     const connections=[
       {baseUrl:endpoints[0],runtimeUrl:endpoints[0],debugToken:'offline-runtime-token',serviceName:'旧名称'},
-      {baseUrl:endpoints[1],debugToken:'offline',serviceName:'备用平台'}
+      {baseUrl:endpoints[1],debugToken:'offline-runtime-token',serviceName:'代理别名'}
     ]
-    await run(`(async()=>{await desktop.invoke('auth:login',{baseUrl:${JSON.stringify(endpoints[0]+'/api')},username:'test',password:'offline-user'});const result=await desktop.invoke('platforms:save',[{name:'测试平台',url:${JSON.stringify(endpoints[0]+'/api')},username:'test',password:'offline'}]);await desktop.invoke('platform:select',result.platforms[0].id);await desktop.invoke('settings:save',{remoteEnabled:true,connections:${JSON.stringify(connections)},modelName:'离线模型'});await bootstrap();await initializeManagement();setView('applications')})()`)
+    await run(`(async()=>{await desktop.invoke('auth:login',{baseUrl:${JSON.stringify(endpoints[0]+'/api')},username:'test',password:'offline-user'});const result=await desktop.invoke('platforms:save',[{name:'测试平台',url:${JSON.stringify(endpoints[0]+'/api')},username:'test',password:'offline'}]);await desktop.invoke('platform:select',result.platforms[0].id);await desktop.invoke('settings:save',{remoteEnabled:true,connections:${JSON.stringify(connections)},modelName:'离线模型',modelBaseUrl:${JSON.stringify(endpoints[0]+'/v1')}});await bootstrap();await initializeManagement();setView('applications')})()`)
     await wait('managed.rows.length===2')
     assert.equal(await run('$("applications").hidden'),false)
     assert.deepEqual(await run('[...$("applicationTable").querySelectorAll("th")].map(th=>th.textContent)'),['应用名称','版本状态','版本号','最新发布时间','操作'])
@@ -134,13 +143,23 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     await shot('design-application-search')
     await run('$("applicationSearchInput").dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}))')
     popup=await opened
+    const designArea=screen.getDisplayMatching(popup.getBounds()).workArea
+    assert.deepEqual(popup.getSize(),[Math.min(1040,designArea.width),Math.min(760,designArea.height)])
+    assert.equal(popup.isResizable()&&!popup.isMaximized(),true)
     await wait('!$("applicationSearch").open')
     checks.push('file-open-searches-application-names-and-opens-design-window')
     const pr=code=>popup.webContents.executeJavaScript(code,true)
     const firstShown=new Promise(resolve=>popup.once('show',()=>pr('({view:document.body.dataset.currentView,applications:getComputedStyle($("applications")).display})').then(resolve)))
     await wait('$("designConnectDialog").open',pr)
-    await wait('$("designConnectExecutor").options[1]?.textContent.startsWith("万科 · ")',pr)
-    assert.match(await pr('$("designConnectExecutor").options[2].textContent'),/^备用平台 · /)
+    await wait('!$("designConnectExecutor").disabled&&$("designConnectExecutor").options[1]?.textContent.startsWith("万科 · ")',pr)
+    assert.equal(await pr('$("designConnectExecutor").options[2].textContent'),'龙湖 · '+endpoints[1])
+    assert.equal(await pr('$("designConnectExecutor").options[2].value'),endpoints[1])
+    assert.ok(requests.some(item=>item.server===1&&item.path==='/virwin/p/28003/19090/api/agent/status'&&item.method==='GET'))
+    runtimeStatusError=401
+    const unavailableService=await pr(`desktop.invoke("executor:service-name",${JSON.stringify(endpoints[1])})`)
+    assert.equal(unavailableService.name,'代理别名')
+    assert.match(unavailableService.reason,/鉴权失败（HTTP 401）/)
+    runtimeStatusError=0
     assert.equal(await pr('$("designConnectExecutor").options[1].value'),endpoints[0])
     assert.equal(await pr('$("designConnectDialog").getBoundingClientRect().width>300'),true)
     assert.equal(requests.filter(item=>item.path.endsWith('/robot/flow/list')).length,initialFlowReads)
@@ -191,6 +210,13 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     assert.match(await pr('$("businessHelp").textContent'),/西安-社保.*V0\.0\.50/)
     await pr('$("businessClose").click()')
     assert.equal(releaseRequests().length,0)
+    const activeSession = await pr(`desktop.invoke('workspace:open',{appCode:'app',flowCode:'flow',executor:${JSON.stringify(endpoints[0])},deferTasks:true}).then(result=>result.session.id)`)
+    const activeId = JSON.stringify(activeSession)
+    await pr(`desktop.invoke('workspace:update',${activeId},{taskCode:'account-one'})`)
+    const activeTurn = pr(`desktop.invoke('agent:start',${activeId},{mode:'develop',request:'分析当前流程'})`)
+    activeTurn.catch(()=>{})
+    for(let i=0;i<150&&!finishAgentResponse;i++)await new Promise(resolve=>setTimeout(resolve,20))
+    assert.ok(finishAgentResponse)
     failProductionSync=true
     await pr('$("syncProduction").click()');await wait('$("businessDialog").open',pr)
     await pr('document.querySelector("[data-field=changeReason]").value="流程优化";document.querySelector("[data-field=comment]").value="流程更新 & 验收";$("businessForm").requestSubmit()')
@@ -205,6 +231,11 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     await pr('$("businessForm").requestSubmit()');await wait('!businessPending&&!$("businessDialog").open',pr)
     assert.deepEqual(releaseRequests().map(item=>item.path.split('/').at(-1)),['release','syncOut','syncOut'])
     assert.match(await pr('$("notice").textContent'),/已同步到生产/)
+    assert.equal(await pr(`desktop.invoke('agent:snapshot',${activeId}).then(value=>value.state)`),'running')
+    finishAgentResponse()
+    await activeTurn
+    await pr(`desktop.invoke('workspace:close',${activeId})`)
+    checks.push('publish-and-retry-sync-while-agent-runs')
     checks.push('application-release-before-production-sync','partial-failure-retries-sync-without-version-bump','application-list-refreshes-after-release')
     await pr('$("resetManagedFlows").click()');await wait('managed.flows.length===3',pr)
     assert.equal(await pr('$("flowServicesPopup").querySelector("input[type=search]").value'),'')
@@ -239,8 +270,8 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     assert.equal(await pr('$("stepPropertiesDialog").open&&$("stepTree").firstElementChild===window.originalStepRow'),true)
     assert.equal(await pr('$("previousStepProperties").disabled&&$("propertyStepPosition").textContent==="1 / 3"'),true)
     await pr('$("nextStepProperties").click()');await wait('selectedStep()?.stepCode==="child"',pr)
-    await pr('$("stepPolicyTab").click();$("nextStepProperties").click()');await wait('selectedStep()?.stepCode==="two"',pr)
-    assert.equal(await pr('$("nextStepProperties").disabled&&!$("stepPolicyPanel").hidden'),true)
+    await pr('$("stepJsonTab").click();$("nextStepProperties").click()');await wait('selectedStep()?.stepCode==="two"',pr)
+    assert.equal(await pr('$("nextStepProperties").disabled&&!$("stepJsonPanel").hidden'),true)
     await pr('$("stepName").value="未提交名称";$("previousStepProperties").click()');await wait('!propertyNavigationPending',pr)
     assert.equal(await pr('selectedStep().stepCode==="two"&&$("stepName").value==="未提交名称"'),true)
     decision=1;await pr('$("previousStepProperties").click()');await wait('selectedStep()?.stepCode==="child"',pr);decision=0
@@ -256,12 +287,19 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     const firstSession=await pr('current.id'),beforeTabClose=confirmations
     assert.equal(await pr('$("stepTree").querySelectorAll(".step-modified").length'),0)
     assert.equal(await pr('$("stepTree").querySelector("[data-step-code=child]").classList.contains("step-voided")'),true)
-    const openAnother=async (appCode,endpoint=endpoints[0])=>{
+    await pr('(()=>{const draft=structuredClone(current.dsl);draft.steps[0].status=1;draft.steps[0].failedStrategy=0;return updateDsl(draft)})()')
+    await pr('desktop.invoke("workspace:save",current.id).then(saved=>{current=saved;renderWorkspace()})')
+    await pr('$("stepName").value="连续保存后的养老登录";commitSelectedStep()')
+    await pr('desktop.invoke("workspace:save",current.id).then(saved=>{current=saved;renderWorkspace()})')
+    assert.equal(rows[0].stepName,'连续保存后的养老登录')
+    const openAnother=async (appCode,endpoint=endpoints[0],expectedServiceIssue)=>{
       const created=new Promise(resolve=>app.once('browser-window-created',(_event,child)=>resolve(child)))
       await run(`desktop.invoke('design:open',{platformId:managed.platformId,appCode:${JSON.stringify(appCode)}})`)
       const child=await created,execute=code=>child.webContents.executeJavaScript(code,true)
-      await wait('$("designConnectDialog").open',execute)
-      await execute(`$('designConnectExecutor').value=${JSON.stringify(endpoint)};$('designConnectForm').requestSubmit()`)
+      await wait('$("designConnectDialog").open&&!$("designConnectExecutor").disabled',execute)
+      await execute(`$('designConnectExecutor').value=${JSON.stringify(endpoint)};$('designConnectExecutor').dispatchEvent(new Event('change'))`)
+      if(expectedServiceIssue)assert.match(await execute('$("designConnectServiceFeedback").textContent'),expectedServiceIssue)
+      await execute('$("designConnectForm").requestSubmit()')
       await wait('document.documentElement.dataset.designReady==="true"',execute)
       return {child,execute}
     }
@@ -303,15 +341,15 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     assert.equal(await pr('getComputedStyle($("toggleAgent")).display'),'none')
     assert.equal(await pr('document.querySelector(".step-workspace-toolbar").contains($("retryTasks"))'),false)
     assert.equal(await pr('$("stepExecutor").previousElementSibling.classList.contains("sr-only")'),true)
-    assert.deepEqual(await pr('[...$("designPageActions").children].map(el=>el.id)'),['taskSelectorHost','stepRun','stepSave'])
-    assert.equal(await pr('$("stepRun").getBoundingClientRect().width>0'),true)
+    assert.deepEqual(await pr('[...$("designPageActions").children].map(el=>el.id)'),['taskSelectorHost','stepRefresh','stepSave'])
+    assert.equal(await pr('$("stepRefresh").getBoundingClientRect().width>0&&$("agentSessionMenu").contains($("stepRun"))'),true)
     assert.equal(await pr('$("taskSelectorHost").contains($("task"))&&$("mode").nextElementSibling===$("send")&&document.querySelector(".agent-heading-title").contains($("composerModel"))&&$("viewExecutionDetails").disabled'),true)
     assert.equal(await pr('getComputedStyle($("agentSessionMenuTrigger")).borderTopWidth'),'0px')
     const agentSelectStyles=()=>pr('["mode","composerModel"].map(id=>{const option=getComputedStyle($(id).options[0]);return [getComputedStyle($(id)).colorScheme,option.backgroundColor,option.color]})')
     assert.deepEqual(await agentSelectStyles(),Array(2).fill(['dark','rgb(44, 44, 46)','rgb(245, 245, 247)']))
     assert.equal(await pr('document.querySelector(".step-view-tabs").lastElementChild.contains($("hideDisabledSteps"))'),true)
     assert.equal(await pr('getComputedStyle(document.querySelector(".step-workspace-toolbar")).display'), 'none')
-    checks.push('account-run-save-on-tabbar','disabled-filter-on-step-header')
+    checks.push('account-refresh-save-on-tabbar-and-run-in-session-menu','disabled-filter-on-step-header')
     assert.equal(await pr('document.querySelector(".agent>.panel-heading").contains($("agentSessionMenuTrigger"))&&["runCurrent","evidence","mcp","stopAgent","viewExecutionDetails","steer"].every(id=>$("agentSessionMenu").contains($(id)))'),true)
     assert.equal(await pr('["assertions","history","businessContext","businessDiagnosis","importBusinessRules","archiveBusinessCase","importExperience","exportExperience","collectExperience","stopExperience"].every(id=>!document.getElementById(id))'),true)
     assert.match(await pr('desktop.invoke("experience:collect").then(()=>"unexpected",error=>error.message)'),/denied/)
@@ -392,13 +430,32 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     await pr('$("hideDisabledSteps").click();renderProperties()')
     checks.push('compact-step-count-header-includes-voided-and-nested-steps','voided-checkbox-filters-display-without-changing-draft-or-input')
     assert.equal(await pr('[...$("stepTree").querySelectorAll(".step-row")].every(row=>row.getBoundingClientRect().height<=42)'),true)
-    const drag=async(sourceCode,targetCode,position='before')=>pr(`(()=>{const list=[...$('stepTree').querySelectorAll('.step-row')],source=list.find(row=>row.dataset.stepCode===${JSON.stringify(sourceCode)}),target=list.find(row=>row.dataset.stepCode===${JSON.stringify(targetCode)}),transfer=new DataTransfer(),rect=target.getBoundingClientRect();source.dispatchEvent(new DragEvent('dragstart',{bubbles:true,cancelable:true,dataTransfer:transfer}));target.dispatchEvent(new DragEvent('dragover',{bubbles:true,cancelable:true,dataTransfer:transfer,clientY:${JSON.stringify(position)}==='after'?rect.bottom-1:rect.top+1}));target.dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:transfer}));source.dispatchEvent(new DragEvent('dragend',{bubbles:true,dataTransfer:transfer}))})()`)
+    const drag=async(sourceCode,targetCode,position='before')=>pr(`(()=>{
+      const tree=$('stepTree'),list=[...tree.querySelectorAll('.step-row')]
+      const source=list.find(row=>row.dataset.stepCode===${JSON.stringify(sourceCode)})
+      const target=list.find(row=>row.dataset.stepCode===${JSON.stringify(targetCode)})
+      const transfer=new DataTransfer(),rect=target.getBoundingClientRect(),position=${JSON.stringify(position)}
+      const dropTarget=position==='outer'?tree:target
+      const location={clientX:position==='outer'?rect.left-4:rect.left+12,
+        clientY:position==='after'?rect.bottom-1:position==='before'?rect.top+1:rect.top+rect.height/2}
+      source.dispatchEvent(new DragEvent('dragstart',{bubbles:true,cancelable:true,dataTransfer:transfer}))
+      dropTarget.dispatchEvent(new DragEvent('dragover',{bubbles:true,cancelable:true,dataTransfer:transfer,...location}))
+      const marker=tree.querySelector('[data-drop-position]')
+      const indicator=marker&&[marker.dataset.stepCode,marker.dataset.dropPosition,marker.hasAttribute('data-drop-outer')]
+      dropTarget.dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:transfer,...location}))
+      source.dispatchEvent(new DragEvent('dragend',{bubbles:true,dataTransfer:transfer}))
+      return indicator
+    })()`)
     await drag('one','two','after');await wait('current.dsl.steps[0].stepCode==="two"',pr)
     assert.equal(await pr('current.dsl.steps[1].children[0].stepCode'),'child')
     assert.equal(rows[0].stepCode,'one')
-    const revision=await pr('current.revision');await drag('two','child');assert.equal(await pr('current.revision'),revision)
-    assert.match(await pr('$("stepToast").textContent'),/同一层级/)
     await drag('one','two');await wait('current.dsl.steps[0].stepCode==="one"',pr)
+    assert.deepEqual(await drag('child','child','outer'),['child','after',true])
+    await wait('current.dsl.steps[1]?.stepCode==="child"',pr)
+    assert.equal(await pr('current.dsl.steps[0].children'),undefined)
+    assert.equal(await pr('selectedStep().stepCode'),'child')
+    assert.deepEqual(await drag('child','one','inside'),['one','inside',false])
+    await wait('current.dsl.steps[0].children?.[0]?.stepCode==="child"',pr)
     await pr('$("stepTree").querySelector(".step-add").click()');await wait('$("stepInsertDialog").open',pr)
     await shot('design-step-insert',popup)
     await pr('$("stepInsertCommand").value="page";$("stepInsertName").value="行内新增步骤";$("stepInsertForm").requestSubmit()');await wait('current.dsl.steps.length===3&&!$("stepInsertDialog").open',pr)
@@ -426,25 +483,42 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     await pr('$("stepInsertCommand").value="page";$("stepInsertName").value="首个步骤";$("stepInsertForm").requestSubmit()');await wait('current.dsl.steps.length===1&&!$("stepInsertDialog").open',pr)
     await pr('updateDsl(window.savedInsertDsl)');await wait('current.dsl.steps.length===3',pr)
     checks.push('plus-dialog-copies-current-branch-with-new-identifiers','plus-dialog-adds-child-and-prevents-third-level','plus-dialog-retains-form-on-name-conflict','plus-dialog-rejects-stale-revision','empty-flow-uses-the-same-add-dialog')
-    checks.push('compact-single-line-step-rows','step-page-headings-and-banner-removed','drag-moves-whole-branch-without-auto-saving','cross-level-drop-is-rejected','row-add-inserts-at-anchor','row-paste-rebuilds-branch-identifiers')
+    checks.push('compact-single-line-step-rows','step-page-headings-and-banner-removed','drag-moves-whole-branch-without-auto-saving','drag-moves-child-in-and-out-with-drop-indicators','row-add-inserts-at-anchor','row-paste-rebuilds-branch-identifiers')
     await shot('design-step-agent',popup)
     await pr('$("task").value="account-one";$("task").dispatchEvent(new Event("change"))');await wait('current.taskCode==="account-one"',pr)
     await pr('$("stepTree").querySelector(".step-settings").click()');await wait('$("stepPropertiesDialog").open',pr)
     assert.equal(await pr('$("targetFields").closest("section").querySelector("h3").textContent'), '目标参数')
-    assert.equal(await pr('$("actionFields").closest("section").querySelector("h3").textContent'), '行为参数')
-    assert.equal(await pr('[...document.querySelectorAll(".argument-json")].every(details=>!details.open)'),true)
-    await pr('$("actionArgs").closest("details").open=true;$("actionArgs").dispatchEvent(new Event("input"));$("actionArgs").closest("details").open=false')
+    assert.equal(await pr('$("actionFields").previousElementSibling.textContent'), '行为参数')
+    assert.equal(await pr('$("stepJsonPanel").hidden'),true)
+    await pr('$("stepJsonTab").click();$("actionArgs").dispatchEvent(new Event("input"));$("stepParametersTab").click()')
     checks.push('target-and-action-parameter-sections','parameter-json-collapsed-by-default')
     assert.equal(await pr(`['showDsl','loadAction','moveUp','moveDown','deleteStep','recording','captureArgument','imageArgument'].every(id=>!$(id).getClientRects().length)`),true)
-    assert.equal(await pr('!$("stepParametersPanel").hidden&&$("stepPolicyPanel").hidden'),true)
-    await pr('$("stepPolicyTab").click()')
-    assert.equal(await pr('$("stepParametersPanel").hidden&&!$("stepPolicyPanel").hidden&&$("stepPolicyTab").getAttribute("aria-selected")==="true"'),true)
+    assert.equal(await pr('!$("stepParametersPanel").hidden&&$("stepJsonPanel").hidden&&$("stepPropertiesDialog").querySelectorAll("[role=tab]").length===2'),true)
+    assert.equal(await pr('$("stepDisabled").closest("label").nextElementSibling===$("previousStepProperties")&&!$("stepDisabled").checked&&!$("stepDisabled").disabled'),true)
+    await pr('$("stepDisabled").click()')
+    assert.equal(await pr('JSON.parse($("stepOptions").value).status===0&&selectedStep().status!==0'),true)
+    await pr('$("stepDisabled").click()')
+    assert.equal(await pr('JSON.parse($("stepOptions").value).status'),1)
+    await pr('$("stepJsonTab").click()')
+    assert.equal(await pr('$("stepParametersPanel").hidden&&!$("stepJsonPanel").hidden&&$("stepJsonTab").getAttribute("aria-selected")==="true"'),true)
+    assert.equal(await pr('$("stepParametersTab").click();$("stepJsonTab").textContent==="JSON"&&!!$("flowControlFields").querySelector("[data-step-option=skipTo]")&&!!$("executionFields").querySelector("[data-step-option=timeout]")'),true)
+    assert.equal(await pr('document.querySelectorAll("[data-step-option=failedSkipTo]").length'),1)
+    assert.equal(await pr('document.querySelector("[data-step-option=failedSkipTo]").closest("#flowControlFields")!==null'),true)
+    await pr(`window.changeStepOption=(key,value)=>{const control=document.querySelector('[data-step-option="'+key+'"]');control.value=value;control.dispatchEvent(new Event('change'))};changeStepOption('failedStrategy','2');$("confirmStepProperties").click()`)
+    await wait('$("stepPropertiesMessage").textContent.includes("请选择失败后跳转目标")',pr)
+    assert.equal(await pr('$("stepPropertiesDialog").open&&document.querySelector("[data-step-option=failedSkipTo]").required'),true)
+    await pr('changeStepOption("failedSkipTo","NEXT");commitSelectedStep()')
+    assert.equal(await pr('selectedStep().failedSkipTo'),'NEXT')
+    await pr('changeStepOption("failedStrategy","1")')
+    assert.equal(await pr('!document.querySelector("[data-step-option=failedSkipTo]").required'),true)
     await pr('document.querySelector("[data-step-option=timeout]").value="77";document.querySelector("[data-step-option=timeout]").dispatchEvent(new Event("input"));$("stepParametersTab").click()')
     assert.equal(await pr('JSON.parse($("stepOptions").value).timeout'),77)
     await pr('$("stepName").value="修复后的养老登录";commitSelectedStep()');await wait('current.dsl.steps[0].stepName==="修复后的养老登录"',pr)
     assert.equal(await pr('current.dsl.steps[0].timeout'),77)
+    assert.equal(await pr('current.dsl.steps[0].failedSkipTo'), 'NEXT')
+    assert.equal(await pr('Object.hasOwn(current.dsl.steps[0],"falseSkipTo")'),false)
     assert.equal(await pr('$("stepTree").querySelector("[data-step-code=one]").classList.contains("step-modified")'),true)
-    await pr('$("stepPolicyTab").dispatchEvent(new KeyboardEvent("keydown",{key:"Home",bubbles:true}))')
+    await pr('$("stepJsonTab").dispatchEvent(new KeyboardEvent("keydown",{key:"Home",bubbles:true}))')
     assert.equal(await pr('document.activeElement.id'), 'stepParametersTab')
     await shot('design-step-properties',popup)
     await pr('$("stepPropertiesDialog").scrollTop=10000')
@@ -476,11 +550,27 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     assert.equal(await pr('$("stepTree").querySelector("[data-step-code=child]").classList.contains("step-voided")'),true)
     checks.push('voided-step-background-on-open','modified-step-background-clears-only-after-save','selected-and-voided-step-states-in-both-themes')
     checks.push('step-gear-opens-properties','toolbar-save-keeps-native-format')
+    const reloadedSession = await pr('current.id')
+    rows[0].stepName = '服务器更新的养老登录'
+    await pr('$("stepName").value="本地草稿";commitSelectedStep()')
+    await assert.rejects(pr('desktop.invoke("workspace:save",current.id)'), /服务器步骤已被修改/)
+    await pr('$("stepRefresh").click()')
+    await wait('!workspaceOpening',pr)
+    assert.equal(await pr('current.dsl.steps[0].stepName'),'本地草稿')
+    const accountReads = requests.filter(item=>item.path.endsWith('/robot/task/listAllTask')).length
+    decision=1;await pr('$("stepRefresh").click()')
+    await wait('!workspaceOpening&&current.savedBaseline.steps[0].stepName==="服务器更新的养老登录"',pr)
+    decision=0
+    assert.deepEqual(await pr('[current.id,$("task").value,$("stepTree").querySelector(".step-modified")===null]'),
+      [reloadedSession,'account-one',true])
+    assert.equal(requests.filter(item=>item.path.endsWith('/robot/task/listAllTask')).length,accountReads+1)
+    checks.push('reload-recovers-server-conflict-and-reloads-accounts-in-place')
     const nativePath='/api/robot/start/remoteTaskFlow/account-one/flow',debugCount=requests.filter(item=>item.path.includes('/robot/debug/')).length,turnBefore=await pr('current.turn?.id||null'),beforeRunConfirmations=confirmations
     assert.deepEqual(await pr('[...$("mode").options].map(item=>item.textContent)'),['调试与修复','仅配置步骤','仅运行'])
     assert.notEqual(await pr('getComputedStyle($("mode")).display'),'none')
     await pr('$("request").value="仅运行时不发送模型";$("request").dispatchEvent(new Event("input"))')
-    await pr('$("stepRun").click()')
+    await pr('$("agentSessionMenuTrigger").click();$("stepRun").click()')
+    assert.equal(await pr('$("agentSessionMenu").matches(":popover-open")'),false)
     for(let i=0;i<150&&!releaseProduction;i++)await new Promise(resolve=>setTimeout(resolve,20))
     assert.ok(releaseProduction)
     await wait('current.productionRunning&&$("stepRun").disabled',pr)
@@ -629,7 +719,9 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     checks.push('subflow-step-opens-own-configuration-tab','tab-switch-keeps-parent-input-and-child-draft','reopen-subflow-reuses-its-tab','dirty-tab-close-can-cancel-and-return-to-parent','missing-subflow-never-reads-template','discarded-child-draft-is-removed-from-active-execution-dependencies')
     failAccounts=true
     assert.equal(await run('desktop.invoke("settings:get").then(value=>value.connections[1].baseUrl)'),endpoints[1])
-    const alternate=await openAnother('app',endpoints[1]),ar=alternate.execute
+    runtimeStatusError=502
+    const alternate=await openAnother('app',endpoints[1],/Runtime 状态读取失败（HTTP 502）/),ar=alternate.execute
+    runtimeStatusError=0
     assert.match(alternate.child.getTitle(),/\/virwin\/p\/28003/)
     await ar('openManagedSteps(managed.flows.find(flow=>flow.flowCode==="flow"))');await wait('!!current&&!taskLoading',ar)
     assert.equal(await ar('current.taskCode||""'),'');assert.equal(await ar('$("task").options.length'),1);assert.match(await ar('$("taskLoadMessage").textContent'),/账户读取暂时失败/)

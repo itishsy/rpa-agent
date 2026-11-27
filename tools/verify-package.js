@@ -4,7 +4,9 @@ const { spawn } = require('node:child_process'), { createHash } = require('node:
 const asar = require('@electron/asar'), net = require('node:net')
 const root = path.resolve(__dirname, '..'), packageDirectory=path.resolve(root,process.argv[2]||'release/win-unpacked')
 const archive = path.join(packageDirectory, 'resources/app.asar')
-const executable = path.join(packageDirectory, 'rpa-agent.exe'), artifacts = path.join(root, 'artifacts')
+const launcher = path.join(packageDirectory, 'rpa-agent.exe')
+const core = path.join(packageDirectory, 'rpa-agent-core.exe')
+const executable = launcher, artifacts = path.join(root, 'artifacts')
 const files = []
 function compare(dir) {
   for(const item of fs.readdirSync(path.join(root, dir), { withFileTypes:true })) {
@@ -14,18 +16,22 @@ function compare(dir) {
   }
 }
 async function main(){
+  assert.ok(fs.existsSync(launcher), 'packaged launcher missing')
+  if (fs.existsSync(core)) assert.ok(fs.statSync(launcher).size < 1024 * 1024, 'packaged launcher is unexpectedly large')
   compare('src')
   const packaged = JSON.parse(asar.extractFile(archive,'package.json'))
   assert.equal(packaged.name,'rpa-agent')
   assert.equal(packaged.version,require('../package.json').version)
   const probe=net.createServer();await new Promise(resolve=>probe.listen(0,'127.0.0.1',resolve));const port=probe.address().port;await new Promise(resolve=>probe.close(resolve))
   const testData=fs.mkdtempSync(path.join(artifacts,'package-data-'))
-  const child=spawn(executable,['--disable-gpu',...process.argv.slice(3),'--remote-debugging-address=127.0.0.1','--remote-debugging-port='+port],{env:{...process.env,RPA_AGENT_TEST_DATA:testData},stdio:'ignore',windowsHide:true})
+  const childEnvironment={...process.env,RPA_AGENT_TEST_DATA:testData}
+  delete childEnvironment.ELECTRON_RUN_AS_NODE
+  const child=spawn(executable,['--disable-gpu','--disable-features=TSFImeSupport',...process.argv.slice(3).filter(argument=>argument!=='--verify-launcher'),'--remote-debugging-address=127.0.0.1','--remote-debugging-port='+port],{env:childEnvironment,stdio:'ignore',windowsHide:true})
   let socket
   try{
     let targets=[]
     for(let i=0;i<150;i++){
-      if(child.exitCode!==null)throw new Error('Packaged app exited '+child.exitCode)
+      if(child.exitCode!==null&&(child.exitCode!==0||!fs.existsSync(core)))throw new Error('Packaged app exited '+child.exitCode)
       try{targets=await (await fetch('http://127.0.0.1:'+port+'/json/list')).json()}catch(_){}
       if(targets.some(target=>target.url.endsWith('/index.html')))break
       await new Promise(resolve=>setTimeout(resolve,100))
@@ -50,7 +56,8 @@ async function main(){
     // Verify real identifiers from the shipped HTML, not test-only UI.
     const structure=await call('Runtime.evaluate',{expression:`['applicationTable','flowManagementTable','executionFields','monitor'].every(id=>!!document.getElementById(id))`,returnByValue:true})
     assert.equal(structure.result.value,true)
-    fs.writeFileSync(path.join(artifacts,'package-check.json'),JSON.stringify({passed:true,sourceFiles:files.length,byteIdentical:true,packagedLaunch:true,securePreload:true,isolatedProfile:true,executable,sha256:createHash('sha256').update(fs.readFileSync(executable)).digest('hex'),checkedAt:new Date().toISOString()},null,2))
+    fs.writeFileSync(path.join(artifacts,'package-check.json'),JSON.stringify({passed:true,sourceFiles:files.length,byteIdentical:true,packagedLaunch:true,securePreload:true,isolatedProfile:true,launcher,
+      executable,launcherSha256:createHash('sha256').update(fs.readFileSync(launcher)).digest('hex'),sha256:createHash('sha256').update(fs.readFileSync(executable)).digest('hex'),checkedAt:new Date().toISOString()},null,2))
     await call('Runtime.evaluate',{expression:'setTimeout(()=>window.close(),50)'})
     for(let i=0;i<50&&child.exitCode===null;i++)await new Promise(resolve=>setTimeout(resolve,100))
     console.log('Package verified: '+files.length+' identical source files; executable launched with isolated data and secure preload.')

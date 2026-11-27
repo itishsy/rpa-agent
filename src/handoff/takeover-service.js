@@ -5,10 +5,16 @@ const {requireRepairHandoff,describeHandoff} = require('./repair-handoff')
 const {TAKEOVER_COMMENT,takeoverBlockReason,takeoverSource,readTakeoverAccount,pauseTakeoverAccount,updateTakeoverAccount} = require('../services/undeclared-monitor')
 function registerTakeoverHandlers({handle,ensureIdentity,activeUserId,userAuth,getSettings,saveSettings,getSnapshot,userRequest,createBusinessService,takeoverContexts,takeovers,assertIdle,refreshUndeclaredData,adapters,harness,openPage,workspaceOwners,requireSession,BrowserWindow,broadcastAccountStatus,broadcastTakeoverStats}) {
   const accountWindows = new Map()
+  function todayKey() {
+    const now=new Date()
+    return [now.getFullYear(),String(now.getMonth()+1).padStart(2,'0'),String(now.getDate()).padStart(2,'0')].join('-')
+  }
   function takeoverStats(userId) {
+    const daily=getSettings().accountTakeoverDaily?.[digest(userId)]
     return {
       userId,
       active:[...accountWindows.values()].filter(entry=>entry.userId===userId&&!entry.win.isDestroyed()).length,
+      today:daily?.date===todayKey()?daily.count:0,
       total:getSettings().accountTakeoverTotals?.[digest(userId)] || 0
     }
   }
@@ -95,6 +101,9 @@ function registerTakeoverHandlers({handle,ensureIdentity,activeUserId,userAuth,g
         const totals=getSettings().accountTakeoverTotals ||= {}
         const userKey=digest(identity.id)
         totals[userKey]=(totals[userKey]||0)+1
+        const daily=getSettings().accountTakeoverDaily ||= {}
+        const date=todayKey()
+        daily[userKey]={date,count:(daily[userKey]?.date===date?daily[userKey].count:0)+1}
         try { saveSettings() }
         catch(error) { console.error('接管统计保存失败',error.message) }
         broadcastTakeoverStats(takeoverStats(identity.id))

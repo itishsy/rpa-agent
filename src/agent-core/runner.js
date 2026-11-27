@@ -9,7 +9,7 @@ const { ExecutorLeases } = require('./executor-leases')
 class AgentRunner {
   constructor({ store, registry, complete, emit = () => {}, leases = new ExecutorLeases(), cancelExecution, budgets = {}, nativeRuns=new Set(), profile }) {
     Object.assign(this, { store, registry, complete, emit, leases, cancelExecution })
-    this.budgets = { modelCalls: 24, toolCalls: 80, executions: 1, durationMs: 15 * 60 * 1000, contextChars: 90000, parallelReads: 4, ...budgets }
+    this.budgets = { modelCalls: 24, toolCalls: 80, executions: 1, evidenceReruns: 2, durationMs: 15 * 60 * 1000, postExecutionModelMs: 120000, contextChars: 90000, parallelReads: 4, ...budgets }
     this.active = new Map(); this.approvals = new Map(); this.recoveries = new Map()
     if (!profile) throw new Error('AgentRunner requires an explicit agent profile')
     this.profile = profile
@@ -86,7 +86,10 @@ class AgentRunner {
     }
     try {
       this.event(session, 'approval/requested', session.pendingApproval)
-      if (!await decision) throw new Error('用户拒绝本次执行')
+      if (!await decision) {
+        if (tool.evidenceRerun) turn.evidenceRerunDenied = true
+        throw new Error('用户拒绝本次执行')
+      }
       checkpoint(turn.controller.signal)
       if (binding !== digest(authority(session, tool, args))) throw new Error('执行上下文已变化，授权失效')
     } finally {
@@ -105,6 +108,7 @@ class AgentRunner {
     if (!turn || turn.controller.signal.aborted) throw new Error('当前没有可接收补充指令的轮次')
     if (expectedTurnId && turn.id !== expectedTurnId) throw new Error('轮次已变化，补充指令未投递')
     if (turn.direct) throw new Error('直接运行期间请使用停止；补充指令适用于 Agent 对话轮次')
+    if (turn.engine === 'codex-cli') throw new Error('Codex 当前阶段请等待本轮结束后发送新需求，或先停止本轮任务')
     if (!String(request).trim() || String(request).length > 32000) throw new Error('补充指令须为1至32000字符')
     const input = { id: randomUUID(), content: String(request), acceptedAt: new Date().toISOString() }
     session.pendingInputs ||= []
@@ -126,7 +130,7 @@ class AgentRunner {
   }
   recordExecutionResult(session, turn, call, result, record) {
     if (call.resultRecord) return call.resultRecord
-    // Persist a known outcome before evidence I/O or asynchronous verification.
+    // Persist a known outcome before evidence I/O.
     // An interrupted receipt is recoverable without replaying the external operation.
     const run = { ...clone(record), callId: call.id, turnId: turn.id,
       artifactId: randomUUID(), evidenceState: 'pending' }
@@ -155,6 +159,13 @@ class AgentRunner {
     session.turn.calls.push(call)
     this.event(session, 'item/started', { callId, tool: name, purpose })
     let release, executionRequest
+    const releaseExecutor = async () => {
+      if (!release) return
+      if (turn.stopPromise) await turn.stopPromise.catch(() => {})
+      release()
+      release = null
+      turn.executing = false
+    }
     try {
       if (!tool) throw new Error('未注册的工具：' + name)
       if(!this.profile.modePolicy(turn.mode).effects.includes(tool.effect))throw new Error(turn.mode==='generate'?'生成模式禁止真实执行':'当前模式不允许该工具操作')
@@ -163,7 +174,13 @@ class AgentRunner {
       const context = { session, signal: turn.controller.signal, harness: this, turn }
       if (tool.effect === 'execute') {
         if (turn.mode === 'generate') throw new Error('生成模式禁止真实执行')
-        if (turn.executions >= this.budgets.executions) throw Object.assign(new Error('本轮执行预算已耗尽'), { code: 'EXECUTION_BUDGET' })
+        if (tool.evidenceRerun) {
+          if (turn.evidenceRerunDenied || (turn.evidenceRerunRequests || 0) >= this.budgets.evidenceReruns) {
+            throw new Error('本轮补充采证申请已结束，请使用现有证据或说明缺口')
+          }
+        } else if (turn.executions >= this.budgets.executions) {
+          throw Object.assign(new Error('本轮执行预算已耗尽'), { code: 'EXECUTION_BUDGET' })
+        }
         if (tool.prepareExecution) {
           executionRequest = freeze(clone(await tool.prepareExecution(args, context)))
           checkpoint(turn.controller.signal)
@@ -172,7 +189,8 @@ class AgentRunner {
           this.store.save(session)
         }
         if (session.pendingInputs?.length) throw Object.assign(new Error('用户已补充指令，旧执行请求已撤销'), { code: 'STEERED' })
-        if (!turn.executionConsent) await this.approve(session, tool, args, turn, call, executionRequest)
+        if (tool.evidenceRerun) turn.evidenceRerunRequests = (turn.evidenceRerunRequests || 0) + 1
+        if (tool.evidenceRerun || !turn.executionConsent) await this.approve(session, tool, args, turn, call, executionRequest)
         checkpoint(turn.controller.signal)
         if (executionRequest) {
           const currentRequest = await tool.prepareExecution(args, context)
@@ -191,12 +209,18 @@ class AgentRunner {
         call.phase = 'submitted'; turn.executionStarted = true; turn.executionContext = clone(context || {})
         this.event(session, 'execution/started', { callId, context: turn.executionContext })
       }
-      const executionObserved = ({ result, record } = {}) => {
+      const executionObserved = async ({ result, record } = {}) => {
         if (call.resultRecord) return call.resultRecord
+        turn.executionStarted = false
+        const releasing = releaseExecutor()
         if (!record) record = { result: { status: result?.status || 'UNKNOWN', executionCode: result?.executionCode },
           taskCode: turn.executionContext?.taskCode, revision: session.revision,
-          verification: { status: 'UNKNOWN', reason: '未完成业务核验' }, at: new Date().toISOString() }
-        return this.recordExecutionResult(session, turn, call, result, record)
+          at: new Date().toISOString() }
+        try {
+          return this.recordExecutionResult(session, turn, call, result, record)
+        } finally {
+          await releasing
+        }
       }
       call.state = 'running'
       this.store.save(session)
@@ -206,7 +230,7 @@ class AgentRunner {
         beginExecution, executionObserved, executionRequest })
       // Only explicitly audited pure readers may outlive cancellation.
       const result = await (tool.effect === 'read' && tool.parallelSafe ? abortable(work, turn.controller.signal) : work)
-      if (tool.effect === 'execute') { executionObserved({ result }); call.phase = 'finalized' }
+      if (tool.effect === 'execute') { await executionObserved({ result }); call.phase = 'finalized' }
       checkpoint(turn.controller.signal)
       call.state = 'completed'
       const output = this.bounded(session, result)
@@ -236,15 +260,28 @@ class AgentRunner {
       }
       throw error
     } finally {
-      if (release && turn.stopPromise) await turn.stopPromise.catch(() => {})
-      if (tool?.effect === 'execute') turn.executing = false
-      if (release) release()
+      await releaseExecutor()
+    }
+  }
+  async sampleModel(session, turn, input) {
+    const afterExecution = session.events.some(event => event.turnId === turn.id && event.type === 'execution/completed')
+    const timeout = afterExecution ? AbortSignal.timeout(this.budgets.postExecutionModelMs) : null
+    const signal = timeout ? AbortSignal.any([turn.controller.signal, timeout]) : turn.controller.signal
+    try {
+      return await abortable(this.complete(input, signal, {
+        session, modelName: turn.modelName, imageIds: turn.imageIds, evidenceImages: turn.evidenceImages
+      }), signal)
+    } catch (error) {
+      if (timeout?.aborted && !turn.controller.signal.aborted) {
+        throw Object.assign(new Error('等待模型分析超时，本轮分析已结束。执行结果和已采集的证据可在执行明细中查看。'), { code: 'MODEL_TIMEOUT' })
+      }
+      throw error
     }
   }
   async conclude(session, turn, reason) {
     if (session.turn.conclusion) return session.turn.conclusion.content
     this.drainInputs(session)
-    let content, source = 'fallback'
+    let content, formatted, warning, source = 'fallback'
     try {
       checkpoint(turn.controller.signal)
       if (turn.modelCalls >= this.budgets.modelCalls) throw new Error('模型预算已耗尽')
@@ -252,8 +289,7 @@ class AgentRunner {
       const messages = this.profile.closingMessages(session, goal, reason, this.budgets.contextChars)
       turn.modelCalls++
       this.event(session, 'model/started', { step: turn.modelCalls, finalization: true })
-      const response = await abortable(this.complete({ messages, tools: [], finalOnly: true }, turn.controller.signal,
-        {session,modelName:turn.modelName,imageIds:turn.imageIds}), turn.controller.signal)
+      const response = await this.sampleModel(session, turn, { messages, tools: [], finalOnly: true })
       checkpoint(turn.controller.signal)
       if (session.pendingInputs?.length) throw new Error('收尾期间收到新指令，旧结论已弃用')
       const message = response?.message || response
@@ -261,18 +297,23 @@ class AgentRunner {
           response?.finishReason != null && response.finishReason !== 'stop') throw new Error('结论响应未正常完成')
       if (validateModelMessage(message, new Set()).length || !message.content?.trim()) throw new Error('收尾只允许文本建议')
       content = message.content.slice(0, 16000); source = 'model'
+      formatted = this.profile.formatConclusion?.(session, content)
     } catch (error) {
       if (turn.controller.signal.aborted && turn.stopReason !== 'timeout') throw error
       this.drainInputs(session)
       session.turn.conclusionError = error.message
-      content = this.profile.fallbackConclusion(session, reason)
+      if (error.code === 'MODEL_TIMEOUT') warning = error.message
+      formatted = this.profile.formatConclusion?.(session)
+      if (!formatted) content = this.profile.fallbackConclusion(session, reason)
     }
+    content = formatted?.content ?? content
     session.turn.conclusion = { content, source, reason }
     session.messages.push({ role: 'assistant', content })
-    this.event(session, 'message/assistant', { content, finalization: true })
+    this.event(session, 'message/assistant', { ...formatted, content, finalization: true, warning })
     return content
   }
-  async start(session, request, { mode = this.profile.defaultMode, executionConsent = false, directTool, signal, writeToEditor = false, modelName, imageIds=[] } = {}) {
+  async start(session, request, { mode = this.profile.defaultMode, executionConsent = false, directTool, signal, writeToEditor = false,
+    modelName, imageIds=[], engine='model-api', externalEngine, durationMs=this.budgets.durationMs } = {}) {
     if (typeof request !== 'string' || !request.trim() || request.length > 32000) throw new Error('需求须为1至32000字符')
     if(session.agentType&&session.agentType!==this.profile.agentType)throw new Error('会话不属于当前Agent类型')
     session.agentType=this.profile.agentType
@@ -282,17 +323,18 @@ class AgentRunner {
     if(!policy.model && (!policy.directTool || directTool?.name !== policy.directTool)) {
       throw new Error('仅运行不能启动模型轮次或调用其他工具')
     }
-    const turn = { id: randomUUID(), controller: new AbortController(), tools: 0, executions: 0, modelCalls: 0, mode, modelName, imageIds, executionConsent, direct: !!directTool, ids: new Set() }
+    const turn = { id: randomUUID(), controller: new AbortController(), tools: 0, executions: 0, modelCalls: 0, mode, modelName, imageIds, engine, executionConsent, direct: !!directTool, ids: new Set() }
     turn.writeToEditor=policy.writeToEditor&&writeToEditor===true
-    this.profile.initializeTurn?.({ session, turn, registry: this.registry })
+    this.profile.initializeTurn?.({ session, turn, registry: this.registry, request })
     this.active.set(session.id, turn)
     if (session.executionUncertain) this.recoveries.set(session.id, session)
     const externalAbort = () => { this.stop(session, 'transport').catch(() => {}) }
     if (signal?.aborted) turn.controller.abort()
     else signal?.addEventListener('abort', externalAbort, { once: true })
-    session.turn = { id: turn.id, mode, writeToEditor:turn.writeToEditor,state: 'running', calls: [], startedAt: new Date().toISOString() }
+    session.turn = { id: turn.id, mode, engine, writeToEditor:turn.writeToEditor,state: 'running', calls: [], startedAt: new Date().toISOString(),
+      ...(turn.recording ? { recording: clone(turn.recording) } : {}) }
     session.state = 'running'; session.title = request.slice(0, 80)
-    const timer = setTimeout(() => { this.stop(session, 'timeout').catch(() => {}) }, this.budgets.durationMs)
+    const timer = setTimeout(() => { this.stop(session, 'timeout').catch(() => {}) }, durationMs)
     try {
       this.drainInputs(session)
       session.messages.push({ role: 'user', content: request })
@@ -303,6 +345,15 @@ class AgentRunner {
           session.messages.push({ role: 'assistant', content: '工具调用已完成：' + directTool.name })
         }
         session.state = 'completed'; this.event(session, 'turn/completed', { result }); return result
+      }
+      if (externalEngine) {
+        const result = await externalEngine({ session, turn, runner: this })
+        checkpoint(turn.controller.signal)
+        session.messages.push({ role: 'assistant', content: result.content })
+        this.event(session, 'message/assistant', { content: result.content, finalization: true, engine })
+        session.state = turn.toolBudgetExhausted ? 'budget_exhausted' : 'completed'
+        this.event(session, 'turn/' + session.state)
+        return result
       }
       const schemas = this.registry.schemas(mode).filter(schema => policy.effects.includes(this.registry.get(schema.function.name)?.effect))
       for (let count = 0; count < this.budgets.modelCalls; count++) {
@@ -315,9 +366,8 @@ class AgentRunner {
         this.profile.decorateContext?.({ messages, selection })
         this.event(session, 'model/started', { step: count + 1, projectedChars: JSON.stringify(messages).length })
         turn.modelCalls++
-        const response = await abortable(this.complete({ messages, tools: availableSchemas,
-          ...(selection.toolChoice ? { toolChoice: selection.toolChoice } : {}) }, turn.controller.signal,
-        {session,modelName:turn.modelName,imageIds:turn.imageIds}), turn.controller.signal)
+        const response = await this.sampleModel(session, turn, { messages, tools: availableSchemas,
+          ...(selection.toolChoice ? { toolChoice: selection.toolChoice } : {}) })
         checkpoint(turn.controller.signal)
         // A sample made before accepted steering has no authority to execute tools.
         if (session.pendingInputs?.length) { this.event(session, 'model/superseded', { step: count + 1 }); continue }
@@ -332,16 +382,22 @@ class AgentRunner {
         }
         if (finishReason === 'tool_calls' && !message?.tool_calls?.length) throw Object.assign(new Error('模型声明了工具调用但未返回完整调用'), { code: 'MODEL_INCOMPLETE' })
         const calls = validateModelMessage(message, turn.ids)
-        session.messages.push(message)
         if (!calls.length) {
-          if (this.profile.acceptConclusion?.({ session, turn, message, runner: this }) === false) continue
-          this.event(session, 'message/assistant', { content: message.content || '', finalization: true })
-          session.state = 'completed'; this.event(session, 'turn/completed'); return message.content
+          if (this.profile.acceptConclusion?.({ session, turn, message, runner: this }) === false) {
+            session.messages.push(message)
+            continue
+          }
+          const formatted = this.profile.formatConclusion?.(session, message.content)
+          const content = formatted?.content ?? message.content
+          session.messages.push(formatted ? { ...message, content } : message)
+          this.event(session, 'message/assistant', { ...formatted, content: content || '', finalization: true })
+          session.state = 'completed'; this.event(session, 'turn/completed'); return content
         }
+        session.messages.push(message)
         this.event(session, 'message/assistant', { content: message.content || '' })
         const perform = async call => {
           if (session.pendingInputs?.length) return { error: '用户已补充指令，本批剩余工具未执行', code: 'STEERED' }
-          const scopeError = this.profile.modelToolError?.(call.function.name)
+          const scopeError = this.profile.modelToolError?.(call.function.name, { session, turn })
           if (scopeError) return scopeError
           if (selection.allowed && !selection.allowed.has(call.function.name)) return {error:'当前阶段不允许扩展调用',code:'GENERATION_PHASE'}
           try { return await this.invoke(session, call.function.name, JSON.parse(call.function.arguments || '{}'), turn, call.id) }
@@ -372,12 +428,13 @@ class AgentRunner {
     } catch (error) {
       // Repair only the unfinished tail; never match outputs from a prior turn.
       closePendingTail(session.messages)
-      if (!directTool && (/_BUDGET$/.test(error.code || '') || turn.stopReason === 'timeout') &&
+      if (!externalEngine && !directTool && (/_BUDGET$/.test(error.code || '') || turn.stopReason === 'timeout') &&
           (!turn.controller.signal.aborted || turn.stopReason === 'timeout')) {
         try { await this.conclude(session, turn, error.message) } catch (closingError) { error = closingError }
       }
-      session.state = turn.controller.signal.aborted ? (turn.stopReason === 'timeout' ? 'budget_exhausted' : 'cancelled') : /_BUDGET$/.test(error.code || '') ? 'budget_exhausted' : 'failed'
-      this.event(session, 'turn/' + session.state, { error: error.message, reason: turn.stopReason })
+      session.state = turn.fatalToolError ? (/_BUDGET$/.test(turn.fatalToolError.code || '') ? 'budget_exhausted' : 'failed')
+        : turn.controller.signal.aborted ? (turn.stopReason === 'timeout' ? 'budget_exhausted' : 'cancelled') : /_BUDGET$/.test(error.code || '') ? 'budget_exhausted' : 'failed'
+      this.event(session, 'turn/' + session.state, { error: turn.stopReason === 'timeout' ? '本轮任务已超时，执行结果与已采集证据已保留' : error.message, reason: turn.stopReason })
       throw error
     } finally {
       clearTimeout(timer); signal?.removeEventListener('abort', externalAbort)
@@ -395,7 +452,7 @@ class AgentRunner {
     turn.stopReason = reason; session.state = 'stopping'
     const running = turn.executionStarted, context = turn.executionContext
     let persistenceError
-    try { this.event(session, 'turn/interrupt_requested', { reason }) } catch (error) { persistenceError = error }
+    try { this.event(session, 'turn/interrupt_requested', { reason, executionPending: !!running }) } catch (error) { persistenceError = error }
     turn.controller.abort()
     turn.stopPromise = (async () => {
       if (running && this.cancelExecution) {
@@ -418,7 +475,7 @@ class AgentRunner {
         run.evidenceState = 'persisted'
         if (call.phase === 'result_received') call.phase = 'result_persisted'
       } else if (run.evidenceState !== 'failed') {
-        run.evidenceState = 'missing'; run.verification = { status: 'UNKNOWN', reason: '进程中断，执行结果已知但完整证据未保存' }
+        run.evidenceState = 'missing'
       }
     }
     session.runs.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))
@@ -435,7 +492,7 @@ class AgentRunner {
       for (const toolCall of session.messages[tail]?.tool_calls || []) {
         const record = session.turn?.calls?.find(call => call.id === toolCall.id)?.resultRecord
         if (record && !outputs.has(toolCall.id)) session.messages.push({ role: 'tool', tool_call_id: toolCall.id,
-          content: JSON.stringify({ ...record.result, businessVerification: record.verification,
+          content: JSON.stringify({ ...record.result,
             artifactId: record.artifactId, evidenceState: record.evidenceState, recovered: true }) })
       }
       closePendingTail(session.messages); session.pendingApproval = null

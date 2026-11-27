@@ -1,5 +1,5 @@
 'use strict'
-let stepDrag=null,stepInsertTarget=null,stepNoticeTimer
+let stepDrag=null,stepDrop=null,stepInsertTarget=null,stepNoticeTimer
 function stepEditingBlocked(){return !current||current.readOnly||workspaceOpening||productionRunningFor(current)||['running','waiting_approval','stopping'].includes(current.state)}
 function showStepNotice(message,error=false){
   if(message.startsWith('流程已打开')||message.startsWith('已登录：')||$('stepPropertiesDialog').open)return
@@ -56,6 +56,7 @@ $('stepInsertForm').onsubmit=async event=>{
     const field=parent?.actionCode==='codeBlock'?'body':'children'
     const list=parent?(parent[field]||[]):current.dsl.steps
     const index=asChild?list.length:path?path.at(-1)+1:list.length
+    let message='步骤已新增，请配置参数后保存流程。'
     if(mode==='new'){
       if(list.some(step=>step.stepName===name))throw new Error('同级步骤名称已存在，请修改名称')
       const dsl=structuredClone(current.dsl),step={stepCode:crypto.randomUUID(),stepName:name,actionCode:command,actionArgs:{},targetArgs:{}}
@@ -71,34 +72,80 @@ $('stepInsertForm').onsubmit=async event=>{
       insertionTarget()
       const destination=parent?preview.dsl.steps.find(step=>step.stepCode===parent.stepCode)[field]:preview.dsl.steps
       await updateDsl(preview.dsl,destination[index].stepCode)
-      if(preview.warnings.length)notice(preview.warnings.join('\n'))
+      message=['步骤已复制，保存流程后同步到平台。',...preview.warnings].join('\n')
     }
-    $('stepInsertDialog').close();notice(mode==='new'?'步骤已新增，请配置参数后保存流程。':'步骤已复制，保存流程后同步到平台。')
+    $('stepInsertDialog').close();notice(message)
   }catch(error){$('stepInsertError').textContent=error.message}
   finally{$('confirmStepInsert').disabled=false;$('closeStepInsert').disabled=false}
 }
-function attachStepDragging(row,step){
+function attachStepDragging(row,step,location){
   row.dataset.stepCode=step.stepCode;row.draggable=!stepEditingBlocked()
+  if(location.length>1)row.dataset.parentStepCode=current.dsl.steps[location[0]].stepCode
   row.addEventListener('dragstart',event=>{
-    if(stepEditingBlocked()||inputDirty()||event.target.closest('.step-row-actions')){event.preventDefault();if(inputDirty())notice('请先更新当前步骤输入',true);return}
+    if(stepEditingBlocked()||inputDirty()||event.target.closest('.step-row-actions,.step-jump-links')){event.preventDefault();if(inputDirty())notice('请先更新当前步骤输入',true);return}
     stepDrag={sessionId:current.id,revision:current.revision,stepCode:step.stepCode}
     event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('application/x-rpa-step',step.stepCode);row.classList.add('dragging')
   })
-  row.addEventListener('dragover',event=>{
-    if(!stepDrag||stepEditingBlocked())return
-    event.preventDefault();event.dataTransfer.dropEffect='move'
-    const rect=row.getBoundingClientRect();row.dataset.dropPosition=event.clientY>rect.top+rect.height/2?'after':'before'
-  })
-  row.addEventListener('dragleave',()=>{delete row.dataset.dropPosition})
-  row.addEventListener('dragend',()=>{stepDrag=null;document.querySelectorAll('.step-row').forEach(item=>{item.classList.remove('dragging');delete item.dataset.dropPosition})})
-  row.addEventListener('drop',async event=>{
-    event.preventDefault();const drag=stepDrag,position=row.dataset.dropPosition||'before';stepDrag=null;delete row.dataset.dropPosition
-    if(!drag||stepEditingBlocked())return
-    try{
-      if(current.id!==drag.sessionId||current.revision!==drag.revision||inputDirty())throw new Error('步骤或输入已变化，请重新拖动')
-      if(drag.stepCode===step.stepCode)return
-      const dsl=window.stepOrder.reorderSteps(current.dsl,drag.stepCode,step.stepCode,position)
-      await updateDsl(dsl,drag.stepCode);notice('步骤顺序已更新，保存后同步到平台。')
-    }catch(error){notice(error.message,true)}
-  })
+  row.addEventListener('dragend',()=>{stepDrag=null;row.classList.remove('dragging');clearStepDrop()})
 }
+const stepTree=$('stepTree')
+function clearStepDrop(){
+  if(stepDrop){
+    delete stepDrop.marker.dataset.dropPosition
+    delete stepDrop.marker.dataset.dropOuter
+    stepDrop=null
+  }
+}
+function stepDropTarget(event){
+  const hit=event.target.closest('.step-row')
+  if(hit){
+    const rect=hit.getBoundingClientRect(), fraction=(event.clientY-rect.top)/rect.height
+    const inside=!hit.dataset.parentStepCode&&fraction>=.28&&fraction<=.72
+    return {row:hit,position:inside?'inside':fraction<.5?'before':'after'}
+  }
+  const rows=[...stepTree.querySelectorAll('.step-row')].filter(row=>row.getClientRects().length)
+  const child=rows.find(row=>{
+    if(!row.dataset.parentStepCode)return false
+    const rect=row.getBoundingClientRect()
+    return event.clientX<rect.left&&event.clientY>=rect.top&&event.clientY<=rect.bottom
+  })
+  if(child)return {row:rows.find(row=>row.dataset.stepCode===child.dataset.parentStepCode),position:'after'}
+  if(rows.length&&event.clientY>=rows.at(-1).getBoundingClientRect().bottom){
+    return {row:rows.findLast(row=>!row.dataset.parentStepCode),position:'after'}
+  }
+  return null
+}
+stepTree.addEventListener('dragover',event=>{
+  if(!stepDrag||stepEditingBlocked())return
+  const drop=stepDropTarget(event)
+  if(!drop?.row){clearStepDrop();return}
+  event.preventDefault();event.dataTransfer.dropEffect='move'
+  const {row,position}=drop
+  if(stepDrop?.row===row&&stepDrop.position===position)return
+  clearStepDrop()
+  let marker=row
+  if(position==='after'&&!row.dataset.parentStepCode){
+    for(let child=row.nextElementSibling;child?.dataset.parentStepCode===row.dataset.stepCode;child=child.nextElementSibling){
+      if(child.getClientRects().length)marker=child
+    }
+  }
+  marker.dataset.dropPosition=position
+  if(marker!==row)marker.dataset.dropOuter=''
+  stepDrop={row,position,marker}
+})
+stepTree.addEventListener('dragleave',event=>{
+  if(!stepTree.contains(event.relatedTarget))clearStepDrop()
+})
+stepTree.addEventListener('drop',async event=>{
+  if(!stepDrag)return
+  event.preventDefault()
+  const drag=stepDrag,drop=stepDrop
+  stepDrag=null;clearStepDrop()
+  if(!drop||stepEditingBlocked())return
+  try{
+    if(current.id!==drag.sessionId||current.revision!==drag.revision||inputDirty())throw new Error('步骤或输入已变化，请重新拖动')
+    const dsl=window.stepOrder.reorderSteps(current.dsl,drag.stepCode,drop.row.dataset.stepCode,drop.position)
+    if(JSON.stringify(dsl)===JSON.stringify(current.dsl))return
+    await updateDsl(dsl,drag.stepCode);notice('步骤位置已更新，保存后同步到平台。')
+  }catch(error){notice(error.message,true)}
+})

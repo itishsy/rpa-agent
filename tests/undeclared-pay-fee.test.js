@@ -266,3 +266,62 @@ test('configured payment data source logs in independently without platform mana
   await fetchUndeclaredData(config);await fetchUndeclaredData(config)
   assert.equal(logins,1);assert.equal(payments,2)
 })
+
+test('already authenticated proxy sources request declare and payment APIs without credentials or oauth login', async t => {
+  const calls=[]
+  const server=http.createServer(async(req,res)=>{
+    calls.push({url:req.url,authorization:req.headers.authorization})
+    req.resume();res.setHeader('Content-Type','application/json')
+    if(req.url==='/api/robot/app/client/list')res.end(JSON.stringify({data:[]}))
+    else if(req.url==='/api/policy/customer/payFee/page')res.end(JSON.stringify({data:{records:[],total:0}}))
+    else if(req.url.startsWith('/api/oauth/token')){res.statusCode=500;res.end(JSON.stringify({message:'不应登录'}))}
+    else{res.statusCode=404;res.end('{}')}
+  })
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>new Promise(resolve=>server.close(resolve)))
+  const baseServer='http://127.0.0.1:'+server.address().port
+  const result=await fetchUndeclaredData({
+    keywords:['武汉-社保'],
+    servers:[{baseServer,username:'',password:''}],
+    paymentServers:[{baseServer,username:'',password:''}]
+  })
+  assert.equal(result.rows.length,0)
+  assert.deepEqual(calls.map(call=>call.url),['/api/robot/app/client/list','/api/policy/customer/payFee/page'])
+  assert.ok(calls.every(call=>call.authorization===undefined))
+})
+
+test('an unauthenticated proxy response explains how to restore its login state', async t => {
+  const server=http.createServer((req,res)=>{
+    req.resume();res.statusCode=401;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({message:'Unauthorized'}))
+  })
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>new Promise(resolve=>server.close(resolve)))
+  const baseServer='http://127.0.0.1:'+server.address().port
+  await assert.rejects(
+    require('../src/services/undeclared-monitor').authenticatedRequest({baseServer,username:'',password:''},'robot/app/client/list',{}),
+    /代理服务登录态无效/
+  )
+})
+
+test('virwin proxy paths always bypass oauth regardless of partial or configured credentials', async t => {
+  const calls=[]
+  const server=http.createServer((req,res)=>{
+    calls.push({path:req.url,authorization:req.headers.authorization})
+    req.resume();res.setHeader('Content-Type','application/json')
+    if(req.url.endsWith('/api/robot/app/client/list'))res.end(JSON.stringify({data:[]}))
+    else if(req.url.endsWith('/api/policy/customer/payFee/page'))res.end(JSON.stringify({data:{records:[],total:0}}))
+    else if(req.url.includes('/api/oauth/token')){res.statusCode=500;res.end(JSON.stringify({message:'proxy must not login'}))}
+    else{res.statusCode=404;res.end('{}')}
+  })
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>new Promise(resolve=>server.close(resolve)))
+  const baseServer=`http://127.0.0.1:${server.address().port}/virwin/p/28006/8088/longhu`
+  for(const credentials of [{},{username:'longhu'},{password:'secret'},{username:'longhu',password:'secret'}]){
+    await fetchUndeclaredData({
+      keywords:['武汉-社保'],
+      servers:[{baseServer,...credentials}],
+      paymentServers:[{baseServer,...credentials}]
+    })
+  }
+  assert.equal(calls.length,8)
+  assert.ok(calls.every(call=>call.path.includes('/virwin/')))
+  assert.ok(calls.every(call=>call.authorization===undefined))
+  assert.ok(calls.every(call=>!call.path.includes('/oauth/token')))
+})

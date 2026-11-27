@@ -2,6 +2,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { createHash, randomUUID } = require('node:crypto')
+const { atomicWriteFileSync } = require('../services/atomic-file')
 
 const clone = value => JSON.parse(JSON.stringify(value))
 function canonical(value) {
@@ -13,7 +14,8 @@ const digest = value => createHash('sha256').update(JSON.stringify(canonical(val
 function redact(value) {
   if (Array.isArray(value)) return value.map(redact)
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) =>
-    [key, /password|passwd|token|secret|cookie|authorization|credential|身份证|手机号/i.test(key) ? '[REDACTED]' : redact(item)]))
+    [key, key === 'base64' && ['image/png', 'image/jpeg', 'video/x-msvideo'].includes(value.contentType) && typeof item === 'string' && /^[A-Za-z0-9+/=]+$/.test(item)
+      ? item : /password|passwd|token|secret|cookie|authorization|credential|身份证|手机号/i.test(key) ? '[REDACTED]' : redact(item)]))
   if (typeof value !== 'string') return value
   return value.replace(/(Bearer\s+)[\w.\-]+/gi, '$1[REDACTED]')
     .replace(/([?&](?:token|password|secret|key)=)[^&#\s]+/gi, '$1[REDACTED]')
@@ -28,8 +30,7 @@ class SessionStore {
   }
   save(session) {
     const target = this.file(session.id)
-    fs.writeFileSync(target + '.tmp', this.codec.encrypt(JSON.stringify(session)), { mode: 0o600 })
-    fs.renameSync(target + '.tmp', target)
+    atomicWriteFileSync(target, this.codec.encrypt(JSON.stringify(session)))
   }
   read(id, scope) {
     const session = JSON.parse(this.codec.decrypt(fs.readFileSync(this.file(id), 'utf8')))
@@ -45,8 +46,7 @@ class SessionStore {
   writeArtifact(sessionId, artifactId, value) {
     const target = this.artifactFile(sessionId, artifactId)
     const text = JSON.stringify(value)
-    fs.writeFileSync(target + '.tmp', this.codec.encrypt(text))
-    fs.renameSync(target + '.tmp', target)
+    atomicWriteFileSync(target, this.codec.encrypt(text))
     return { external: true, bytes: Buffer.byteLength(text) }
   }
   readArtifact(sessionId, artifactId) {

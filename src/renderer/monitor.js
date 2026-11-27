@@ -101,7 +101,7 @@ function createTaskMonitor(monitorRoot = document) {
     function formatTaskStatus(item) {
       const status = String(item.taskStatus || '').trim()
       const comment = String(item.taskComment || '').trim()
-      return status === '已停用' && comment ? `${status}（${comment}）` : status
+      return ['已停用','已启用'].includes(status) && comment ? `${status}（${comment}）` : status
     }
 
     function appendTaskDetails(row, item) {
@@ -361,13 +361,13 @@ function createTaskMonitor(monitorRoot = document) {
       baseServer.value = server.baseServer || ''
       const username = document.createElement('input')
       username.className = 'server-username'
-      username.placeholder = 'username'
+      username.placeholder = '可留空（代理已登录）'
       username.value = server.username || ''
       const password = document.createElement('input')
       password.className = 'server-password'
       password.type = 'password'
       password.autocomplete = 'new-password'
-      password.placeholder = server.hasPassword ? '已保存，留空不修改' : 'password'
+      password.placeholder = server.hasPassword ? '已保存，留空不修改' : '可留空（代理已登录）'
       const removeButton = document.createElement('button')
       removeButton.type = 'button'
       removeButton.className = 'button remove-server'

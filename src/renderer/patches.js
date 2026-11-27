@@ -29,7 +29,7 @@ function renderPatchCard(){
     patchChangeList($('patchChanges'),proposal,proposal.targetFlowCode?null:current.dsl)
   }
   const run=proposal.id&&current.runs?.find(item=>item.proposalId===proposal.id)
-  $('patchStatus').textContent=(proposal.targetFlowCode?'子流程：'+(proposal.dsl.flowName||proposal.targetFlowCode)+' · ':'')+(proposal.operations?.length||0)+' 项修改 · '+(run?'调试结果：'+run.result.status+' · 业务核验：'+run.verification?.status:'尚未运行验证')+' · '+(proposal.advisoryOnly?'只读建议，不能直接应用':'应用到本地步骤后，仍需检查并保存')
+  $('patchStatus').textContent=(proposal.targetFlowCode?'子流程：'+(proposal.dsl.flowName||proposal.targetFlowCode)+' · ':'')+(proposal.operations?.length||0)+' 项修改 · '+(run?'调试结果：'+debugExecutionResult.statusLabel(run.result.status):'尚未运行验证')+' · '+(proposal.advisoryOnly?'只读建议，不能直接应用':'应用到本地步骤后，仍需检查并保存')
   $('previewCandidate').disabled=workspaceOpening||productionRunningFor(current)||['running','waiting_approval','stopping'].includes(current.state)
 }
 async function showPatchReview(){

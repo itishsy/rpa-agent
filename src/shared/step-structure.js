@@ -4,6 +4,15 @@
   else root.stepStructure = api
 })(typeof globalThis === 'object' ? globalThis : this, function () {
   const jumps = ['skipTo', 'failedSkipTo', 'falseSkipTo']
+  function normalizeFailureJumps(dsl) {
+    const visit = steps => (steps || []).forEach(step => {
+      if (!step.failedSkipTo && step.falseSkipTo) step.failedSkipTo = step.falseSkipTo
+      delete step.falseSkipTo
+      visit(step.body); visit(step.children)
+    })
+    visit(dsl?.steps)
+    return dsl
+  }
   function scopes(steps) {
     const result = [], current = []
     for (const step of steps || []) {
@@ -39,5 +48,5 @@
     }
     return diagnostics
   }
-  return { scopes, renameReferences, cleanJumps,jumpDiagnostics }
+  return { scopes, normalizeFailureJumps, renameReferences, cleanJumps,jumpDiagnostics }
 })

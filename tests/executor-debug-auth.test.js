@@ -23,3 +23,17 @@ test('debug requests send the trimmed token through the configured proxy path an
   await assert.rejects(request(baseUrl, input), error => error.code === 'EXECUTOR_DEBUG_AUTH' &&
     error.message.includes(baseUrl) && !error.message.includes('test-debug-token'))
 })
+
+test('FRP account lookup forwards the configured debug token', async t => {
+  const server = http.createServer((req, res) => {
+    if (req.headers['x-rpa-debug-token'] !== 'test-debug-token') res.statusCode = 401
+    res.end('{"code":200,"data":[]}')
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => server.close(resolve)))
+  const baseUrl = 'http://127.0.0.1:' + server.address().port
+  const result = await request(baseUrl, {
+    path: '/api/robot/task/listAllTask?appCode=test', method: 'POST', debugToken: 'test-debug-token'
+  })
+  assert.deepEqual(result.data, [])
+})

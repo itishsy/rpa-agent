@@ -6,7 +6,7 @@ const INTEGER_FIELDS = [
 ]
 const EXECUTION_FIELDS = [
   'failedRetry', 'failedStrategy', 'skipTo', 'failedSkipTo',
-  'falseSkipTo', 'skipCondition', 'waitBefore', 'waitAfter',
+  'skipCondition', 'waitBefore', 'waitAfter',
   'timeout', 'maxExecuteNum', 'status'
 ]
 
@@ -77,20 +77,23 @@ function enabledDebugSteps(steps, native = false) {
 
 function buildDebugDsl (appCode, flowCode, appDetail, stepList, selectedStep, options = {}) {
   if (!appCode || !flowCode) throw new Error('应用编码或流程编码为空')
+  const validate = options.validate !== false
   const detail = appDetail || {}
   const allSources = flattenSources(stepList)
-  if (!allSources.length && !options.draft) throw new Error('流程没有启用的步骤')
+  if (validate && !allSources.length && !options.draft) throw new Error('流程没有启用的步骤')
   if (selectedStep && !allSources.includes(selectedStep)) throw new Error('未找到要运行的步骤')
   const usedCodes = new Set(allSources.map(source => source.stepCode).filter(Boolean))
-  if (usedCodes.size !== allSources.filter(source => source.stepCode).length) throw new Error('步骤编码重复，不能生成完整 DSL')
+  if (validate && usedCodes.size !== allSources.filter(source => source.stepCode).length) throw new Error('步骤编码重复，不能生成完整 DSL')
   const usedNames = new Set()
 
   function convertStep (source, position, listKey) {
-    if (!source.stepName || !String(source.stepName).trim()) throw new Error('第' + position + '个步骤缺少步骤名称')
-    if (!source.actionCode) throw new Error('步骤“' + source.stepName + '”缺少指令')
-    const nameKey = listKey + '/' + source.stepName
-    if (usedNames.has(nameKey)) throw new Error('步骤名称重复：' + source.stepName)
-    usedNames.add(nameKey)
+    if (validate) {
+      if (!source.stepName || !String(source.stepName).trim()) throw new Error('第' + position + '个步骤缺少步骤名称')
+      if (!source.actionCode) throw new Error('步骤“' + source.stepName + '”缺少指令')
+      const nameKey = listKey + '/' + source.stepName
+      if (usedNames.has(nameKey)) throw new Error('步骤名称重复：' + source.stepName)
+      usedNames.add(nameKey)
+    }
     let stepCode = source.stepCode
     if (!stepCode) {
       let suffix = allSources.indexOf(source) + 1
@@ -108,7 +111,7 @@ function buildDebugDsl (appCode, flowCode, appDetail, stepList, selectedStep, op
     if (Object.keys(actionArgs).length) step.actionArgs = actionArgs
     if (Object.keys(targetArgs).length) step.targetArgs = targetArgs
     EXECUTION_FIELDS.forEach(field => {
-      let value = source[field]
+      let value = field === 'failedSkipTo' ? (source.failedSkipTo || source.falseSkipTo) : source[field]
       if (INTEGER_FIELDS.includes(field)) value = integerOrNull(value, source.stepName + '的' + field)
       if (field === 'status' && (value === null || value === 1)) return
       if (field === 'failedRetry' && (value === null || value === 1)) return
@@ -122,7 +125,7 @@ function buildDebugDsl (appCode, flowCode, appDetail, stepList, selectedStep, op
   function convertParent (source, position) {
     const step = convertStep(source, position, 'main')
     const children = source.list || []
-    if (source.actionCode === 'codeBlock' && !children.length && !options.draft) throw new Error('代码块“' + source.stepName + '”没有步骤或块内步骤均已禁用')
+    if (validate && source.actionCode === 'codeBlock' && !children.length && !options.draft) throw new Error('代码块“' + source.stepName + '”没有步骤或块内步骤均已禁用')
     if (children.length) {
       const field = source.actionCode === 'codeBlock' ? 'body' : 'children'
       const listKey = field === 'body' ? step.stepCode : 'main'
@@ -223,7 +226,7 @@ function referencedDebugFlows (dsl, options = {}) {
         const flowName = (step.actionArgs || {}).flowName
         if (!flowName) {
           if(options.onMissing)options.onMissing(step)
-          else if (active) throw new Error('步骤“' + step.stepName + '”缺少调用流程名称')
+          else if (options.validate !== false) throw new Error('步骤“' + step.stepName + '”缺少调用流程名称')
         }else names.add(flowName)
       }
       // 普通子步骤仍会执行，即使父步骤被禁用；代码块 body 则只在调用步骤启用时执行。
@@ -266,26 +269,94 @@ function assertCompleteDebugDsl(dsl) {
   }
   return dsl
 }
+function createReferencedFlowReader(api) {
+  const catalogs = new Map()
+  const definitions = new Map()
+  async function flowsOf(appCode) {
+    if (!catalogs.has(appCode)) {
+      const rows = await api.listFlows(appCode)
+      if (!Array.isArray(rows)) throw new Error('无法获取应用流程列表：' + appCode)
+      catalogs.set(appCode, rows)
+    }
+    return catalogs.get(appCode)
+  }
+  async function *sources(flow) {
+    const seen = new Set([flow.flowCode])
+    while (flow.relationFlowCode) {
+      const code = flow.relationFlowCode
+      if (seen.has(code)) throw new Error('流程引用关系存在循环：' + code)
+      seen.add(code)
+      if (!definitions.has(code)) {
+        const source = await api.getFlow(code)
+        if (source?.flowCode !== code || !source.appCode) throw new Error('未找到引用流程：' + code)
+        definitions.set(code, source)
+      }
+      flow = definitions.get(code)
+      yield flow
+    }
+  }
+  async function stepsOf(flow) {
+    const read = async target => {
+      const rows = await api.listSteps(target)
+      if (!Array.isArray(rows)) throw new Error('流程步骤必须为数组：' + target.flowName)
+      return rows
+    }
+    const rows = await read(flow)
+    if (rows.length) return rows
+    for await (const source of sources(flow)) {
+      const sourceRows = await read(source)
+      if (sourceRows.length) return sourceRows
+    }
+    return rows
+  }
+  async function sourceApp(flow, owner) {
+    if (flow) for await (const source of sources(flow)) owner = source.appCode
+    return owner
+  }
+  async function identity(flow) {
+    // Different reference entries can point to the same shared executable flow.
+    for await (const source of sources(flow)) flow = source
+    return flow.flowCode
+  }
+  return { flowsOf, stepsOf, sourceApp, identity }
+}
+
 /** 按主流程引用关系，递归加载被调用流程及其子流程。 */
 async function loadReferencedDebugFlows (dsl, appCode, api, options = {}) {
-  // Current executor: resolve calls only from the current application's rows.
+  const validate = options.validate !== false
   const cleaned=dslMetadata(dsl)
   cleaned.steps = enabledDebugSteps(cleaned.steps)
   for(const key of Object.keys(dsl))delete dsl[key]
   Object.assign(dsl,cleaned)
-  const rawFlows=await api.listFlows(appCode)
-  if(!Array.isArray(rawFlows))throw new Error('无法获取当前应用流程列表')
-  const currentFlows=rawFlows.map(flowMetadata)
+  const reader = createReferencedFlowReader(api)
+  const currentFlows = await reader.flowsOf(appCode)
   const inspectionDiagnostics=[]
   const references=definition=>referencedDebugFlows(definition,{
+    validate,
     ...(options.inspect?{onMissing:step=>inspectionDiagnostics.push({flowCode:definition.flowCode,flowName:definition.flowName,
       stepCode:step.stepCode,message:'步骤“'+step.stepName+'”缺少调用流程名称'})}:{})})
-  const pending = references(dsl).map(flowName => ({ flowName, path: [dsl.flowName, flowName] }))
+  const pending = []
+  async function enqueue(definition, flow, owner, path) {
+    const names = references(definition)
+    if (!names.length) return
+    const sourceApp = await reader.sourceApp(flow, owner)
+    for (const flowName of names) pending.push({ flowName, owner: sourceApp, path: [...path, flowName] })
+  }
+  try {
+    await enqueue(dsl, currentFlows.find(flow => flow.flowCode === dsl.flowCode), appCode, [dsl.flowName])
+  } catch (error) {
+    if (!options.inspect) throw error
+    inspectionDiagnostics.push({ flowName: dsl.flowName, path: [dsl.flowName], message: error.message })
+  }
   // Reading one called flow must not depend on executable validation of its
   // siblings or descendants. Reachability and ownership resolution still apply.
   const preferred=currentFlows.find(flow=>flow.flowCode===options.targetFlowCode)?.flowName
   if(options.inspect&&preferred)pending.sort((a,b)=>Number(b.flowName===preferred)-Number(a.flowName===preferred))
-  const loaded = new Map([[dsl.flowName, dsl.flowCode]])
+  const rootFlow = currentFlows.find(flow => flow.flowCode === dsl.flowCode) || dsl
+  let rootIdentity = dsl.flowCode
+  try { rootIdentity = await reader.identity(rootFlow) }
+  catch (error) { if (!options.inspect) throw error }
+  const loaded = new Map([[dsl.flowName, rootIdentity]])
   dsl.subflows = []
   function unique(flows, name, where) {
     const matches = flows.filter(flow => flow.flowName === name)
@@ -293,48 +364,49 @@ async function loadReferencedDebugFlows (dsl, appCode, api, options = {}) {
     if (identities.size > 1) throw new Error('调用流程同名不唯一：' + name + '（' + where + '）')
     return matches[0]
   }
-  async function resolve(name,path) {
-    const flow=unique(currentFlows,name,'当前应用'+appCode)
-    if(flow)return {flow,foundInApp:appCode}
-    throw new Error('未找到当前应用的调用流程：'+name+'（调用路径：'+path.join(' → ')+'）')
+  async function resolve(name,owner,path) {
+    const candidates = owner === appCode ? [appCode] : [owner, appCode]
+    for (const code of candidates) {
+      const flow = unique(await reader.flowsOf(code), name, '应用 '+code)
+      if (flow) return { flow, foundInApp: code }
+    }
+    const subject = owner === appCode ? '当前应用' : '引用来源及当前应用'
+    throw new Error('未找到'+subject+'的调用流程：'+name+'（调用路径：'+path.join(' → ')+'）')
   }
   while (pending.length) {
-    const { flowName, path } = pending.shift()
+    const { flowName, owner, path } = pending.shift()
     try {
-    const { flow, foundInApp } = await resolve(flowName,path)
+    const { flow, foundInApp } = await resolve(flowName,owner,path)
     if (loaded.has(flowName)) {
-      if (loaded.get(flowName) !== flow.flowCode) throw new Error('打包存在同名流程来源冲突：' + path.join(' → '))
+      if (loaded.get(flowName) !== await reader.identity(flow)) throw new Error('打包存在同名流程来源冲突：' + path.join(' → '))
       continue
     }
     if (loaded.size >= 5000) throw new Error('调用流程数量超过完整打包限制')
     // Apply local drafts and candidates before discovering their descendants.
-    const draft = api.overrideFlow ? await api.overrideFlow(flow, foundInApp) : null
-    const rawSteps=draft?null:await api.listSteps(flow)
-    if(!draft&&!Array.isArray(rawSteps))throw new Error('流程步骤必须为数组：'+flowName)
-    if (!draft && (!rawSteps || !rawSteps.length)) {
+    const draft = !flow.relationFlowCode && api.overrideFlow ? await api.overrideFlow(flow, foundInApp) : null
+    const rawSteps = draft ? null : await reader.stepsOf(flow)
+    if (validate && !draft && !rawSteps.length) {
       throw new Error('无法获取调用流程步骤：' + flowName)
     }
     let definition = draft ? { ...flow, appCode: foundInApp, steps: enabledDebugSteps(draft.steps) }
-      : buildDebugDsl(foundInApp, flow.flowCode, flow, enabledDebugSteps(nestDebugSteps(rawSteps), true), undefined, { draft: !!options.inspect })
-    if (api.prepareFlow&&!options.inspect) definition = await api.prepareFlow(definition, flow, foundInApp)
+      : buildDebugDsl(foundInApp, flow.flowCode, flow, enabledDebugSteps(nestDebugSteps(rawSteps), true), undefined, { draft: !!options.inspect, validate })
+    if (validate && api.prepareFlow && !options.inspect) definition = await api.prepareFlow(definition, flow, foundInApp)
     if (definition.flowCode !== flow.flowCode || definition.flowName !== flowName) throw new Error('子流程转换改变了调用身份：' + path.join(' → '))
     dsl.subflows.push({
       flowCode: definition.flowCode,
       flowName: definition.flowName,
       steps: definition.steps,
     })
-    loaded.set(flowName, flow.flowCode)
+    loaded.set(flowName, await reader.identity(flow))
     if(options.inspect&&flow.flowCode===options.targetFlowCode)break
-    references(definition).forEach(name => {
-      pending.push({ flowName: name, path: [...path, name] })
-    })
+    await enqueue(definition, flow, foundInApp, path)
     }catch(error){
       if(!options.inspect)throw error
       inspectionDiagnostics.push({flowName,path,message:error.message})
     }
   }
   if(options.inspect)return {...dsl,inspectionDiagnostics}
-  return assertCompleteDebugDsl(dsl)
+  return validate ? assertCompleteDebugDsl(dsl) : dsl
 }
 
-module.exports = { buildDebugDsl, enabledDebugSteps, nestDebugSteps, referencedDebugFlows, loadReferencedDebugFlows, assertCompleteDebugDsl }
+module.exports = { buildDebugDsl, enabledDebugSteps, nestDebugSteps, referencedDebugFlows, createReferencedFlowReader, loadReferencedDebugFlows, assertCompleteDebugDsl }

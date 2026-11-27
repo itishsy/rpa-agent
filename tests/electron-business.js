@@ -141,9 +141,10 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     await run('const detail=document.querySelector("[data-argument-key=details]");detail.value="说明内容";detail.dispatchEvent(new Event("input"));commitSelectedStep()');await wait('current.dsl.steps[0].actionArgs.details==="说明内容"')
     await run('$("stepSave").click()');await wait('!$("stepSave").disabled');assert.equal(steps[0].stepName,'重命名步骤');assert.equal(JSON.parse(steps[0].actionArgs).details,'说明内容')
     mark('步骤动态控件、条件显示、必填数值0、重命名同步跳转、未更新输入保存拦截、原生VO保存')
-    await run(`for(const [key,value] of Object.entries({status:'0',failedStrategy:'2',failedRetry:'0',timeout:'10',waitBefore:'1',waitAfter:'2',maxExecuteNum:'3',failedSkipTo:'步骤二',falseSkipTo:'步骤二',skipCondition:'ctx.skip'})){const el=document.querySelector('[data-step-option="'+key+'"]');el.value=value;el.dispatchEvent(new Event(el.tagName==='SELECT'?'change':'input'))}commitSelectedStep()`)
-    await wait('current.dsl.steps[0].status===0');await run('$("stepSave").click()');await wait('!$("stepSave").disabled');assert.equal(steps[0].failedStrategy,2);assert.equal(steps[0].failedRetry,0);assert.equal(steps[0].timeout,10);assert.equal(steps[0].failedSkipTo,'步骤二')
-    mark('原生流转控件：禁用、失败跳转、条件跳转、跳过表达式、零次重试、超时、等待和执行上限保存')
+    await run(`for(const [key,value] of Object.entries({failedStrategy:'2',failedRetry:'0',timeout:'10',waitBefore:'1',waitAfter:'2',maxExecuteNum:'3',failedSkipTo:'步骤二',skipCondition:'ctx.skip'})){const el=document.querySelector('[data-step-option="'+key+'"]');el.value=value;el.dispatchEvent(new Event(el.tagName==='SELECT'?'change':'input'))}$("stepDisabled").checked=true;$("stepDisabled").dispatchEvent(new Event('change'));commitSelectedStep()`)
+    await wait('current.dsl.steps[0].status===0');await run('$("stepSave").click()');await wait('!$("stepSave").disabled');assert.equal(steps[0].failedStrategy,2);assert.equal(steps[0].failedRetry,0);assert.equal(steps[0].timeout,10);assert.equal(steps[0].failedSkipTo,'步骤二');assert.equal(Object.hasOwn(steps[0],'falseSkipTo'),false)
+    mark('原生流转控件：禁用、共用失败跳转、跳过表达式、零次重试、超时、等待和执行上限保存')
+    steps[0].status=1 // Keep later read-only-flow cases independent from this disabled-step assertion.
     await run('$("copyStep").click()');await wait('!$("copyStep").disabled');await run('$("pasteStep").click()');await wait('current.dsl.steps.length===3');await run('$("pasteStep").click()');await wait('current.dsl.steps.length===4')
     assert.equal(await run('new Set(current.dsl.steps.map(s=>s.stepCode)).size'),4);assert.equal(await run('new Set(current.dsl.steps.map(s=>s.stepName)).size'),4)
     await run('$("moveUp").click()');await wait('!$("moveUp").disabled');await snap('steps-acceptance')
@@ -182,7 +183,7 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     const designCreated=new Promise(resolve=>app.once('browser-window-created',(_e,child)=>resolve(child)))
     await mr('document.querySelector(".task-details a").click()');const taskDesign=await designCreated
     const dr=code=>taskDesign.webContents.executeJavaScript(code,true)
-    await wait('$("designConnectDialog").open',dr)
+    await wait('$("designConnectDialog").open&&!$("designConnectExecutor").disabled',dr)
     await dr(`$('designConnectExecutor').value=${JSON.stringify(endpoint)};$('designConnectForm').requestSubmit()`)
     await wait('document.documentElement.dataset.designReady==="true"&&managed.flows.length>0',dr)
     assert.equal(taskDesign.getTitle(),'武汉-社保（连接至 '+new URL(endpoint).host+'）');assert.equal(taskDesign.getParentWindow(),null)
@@ -193,7 +194,7 @@ app.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-l
     const fallbackCreated=new Promise(resolve=>app.once('browser-window-created',(_e,child)=>resolve(child)))
     await run(`desktop.invoke('monitor:open-flow',{baseServer:${JSON.stringify(endpoint)},appCode:'missing-code',appName:'武汉-社保',taskName:'增员'})`)
     const fallbackDesign=await fallbackCreated,fr=code=>fallbackDesign.webContents.executeJavaScript(code,true)
-    await wait('$("designConnectDialog").open',fr)
+    await wait('$("designConnectDialog").open&&!$("designConnectExecutor").disabled',fr)
     await fr(`$('designConnectExecutor').value=${JSON.stringify(endpoint)};$('designConnectForm').requestSubmit()`)
     await wait('document.documentElement.dataset.designReady==="true"',fr);assert.equal(await fr('managed.app.appCode'),'app')
     const windowsBefore=BrowserWindow.getAllWindows().length

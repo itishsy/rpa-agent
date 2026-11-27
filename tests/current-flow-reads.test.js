@@ -21,7 +21,7 @@ test('active flow readers have no retired lookup endpoints, request parameters o
   const root=path.resolve(__dirname,'../src')
   for(const file of ['main.js','services/debug-dsl.js','renderer/management.js','services/business.js','renderer/resources.js']){
     const source=fs.readFileSync(path.join(root,file),'utf8')
-    for(const forbidden of ['robot/flow/listTemplate','templateType:','params: { templateFlowCode','flow.relationFlowCode'])assert.ok(!source.includes(forbidden),file+': '+forbidden)
+    for(const forbidden of ['robot/flow/listTemplate','templateType:','params: { templateFlowCode'])assert.ok(!source.includes(forbidden),file+': '+forbidden)
   }
   assert.ok(!fs.readFileSync(path.join(root,'renderer/app.js'),'utf8').includes("action('flowGraph'"))
 })

@@ -79,11 +79,12 @@ function clearWorkspace() {
   if(typeof clearWorkspaceTabs==='function')clearWorkspaceTabs()
   taskLoadSequence++;taskLoading=false;taskLoadError='';updateTaskLoadFeedback('')
   current = null; selected = null; approvals = null; snapshotRequest++
+  renderAgentActivity()
   $('revision').textContent = '未打开'; $('agentState').textContent = 'idle'; $('stepTree').replaceChildren(); $('stepTree').textContent = '请选择流程并打开步骤设置'
   $('dsl').value = '{}'; $('stepName').value = ''; $('actionCode').value = ''
   for (const id of ['actionArgs','targetArgs','stepOptions']) $(id).value = '{}'
   $('actionFields').replaceChildren(); $('targetFields').replaceChildren(); $('approval').hidden = true; $('candidate').hidden = true
-  $('executionFields').replaceChildren()
+  renderExecutionFields()
   if($('stepToast'))$('stepToast').hidden=true
   document.querySelectorAll('#stepInsertMenu:popover-open,.agent-action-menu:popover-open').forEach(menu=>menu.hidePopover())
   $('designStepTab').hidden=true;$('designStepTabGroup').hidden=true;$('workspaceFlowName').textContent=''
@@ -140,7 +141,7 @@ function appendMessage(content, kind = '') {
   return item
 }
 function appendDebugConclusion(data) {
-  const content = data.content || debugExecutionResult.conclusion(data, data.verification).content
+  const content = data.content || debugExecutionResult.conclusion(data).content
   const item = appendMessage(content, data.status === 'FAILED' ? 'error' : '')
   if (!data.artifactId) return item
   const button = document.createElement('button')
@@ -180,29 +181,114 @@ function renderProperties() {
   $('targetArgs').value = pretty(step?.targetArgs || {})
   const options = step ? Object.fromEntries(Object.entries(step).filter(([key]) => !['stepCode', 'stepName', 'actionCode', 'actionArgs', 'targetArgs', 'body', 'children'].includes(key))) : {}
   $('stepOptions').value = pretty(options)
-  if(document.documentElement.dataset.windowMode==='design'&&$('stepPolicyPanel').hidden)$('executionFields').replaceChildren()
-  else renderExecutionFields()
+  renderExecutionFields()
   $('actionFields').replaceChildren(); $('targetFields').replaceChildren()
   if (step) loadActionSchemas().catch(error => { $('actionSchema').textContent = error.message })
   if(typeof updatePropertyNavigation==='function')updatePropertyNavigation()
 }
+function readStepOptions() {
+  try {
+    const options = JSON.parse($('stepOptions').value)
+    return options && typeof options === 'object' && !Array.isArray(options) ? options : null
+  } catch (_) { return null }
+}
+function syncStepDisabled(values = readStepOptions()) {
+  const step = selectedStep(), toggle = $('stepDisabled')
+  const status = values ? values.status : step?.status
+  toggle.checked = status === 0 || status === '0'
+  toggle.disabled = !step || !values || stepEditingBlocked()
+}
+$('stepDisabled').addEventListener('change', () => {
+  const values = readStepOptions()
+  if (!values || !selectedStep() || stepEditingBlocked()) { syncStepDisabled(values); return }
+  values.status = $('stepDisabled').checked ? 0 : 1
+  $('stepOptions').value = pretty(values)
+})
+function stepJumpScope(stepCode) {
+  return window.stepStructure.scopes(current.dsl.steps).find(list=>list.some(item=>item.stepCode===stepCode)) || []
+}
+function stepJumpLinks(step, scope, tree) {
+  const links = document.createElement('span')
+  links.className = 'step-jump-links'
+  for (const [value, label, kind, symbol] of [
+    [step.skipTo, '成功', 'success', '✓'],
+    [step.failedSkipTo || step.falseSkipTo, '失败/条件不成立', 'failure', '↪']
+  ]) {
+    if (!value) continue
+    const next = value === 'NEXT'
+    const target = next ? scope[scope.findIndex(item => item.stepCode === step.stepCode) + 1] :
+      scope.find(item => item.stepName === value)
+    const link = document.createElement('button')
+    link.type = 'button'
+    link.className = 'step-jump-link'
+    link.dataset.jumpKind = kind
+    link.classList.toggle('missing', !next && !target)
+    const targetText = (next ? '下一步' : value) + (!next && !target ? '（目标不存在）' : '')
+    const icon = document.createElement('span')
+    icon.className = 'step-jump-icon'
+    icon.setAttribute('aria-hidden', 'true')
+    icon.textContent = symbol
+    link.append(icon, targetText)
+    link.title = label + ' → ' + targetText
+    link.setAttribute('aria-label', link.title)
+    link.onclick = () => {
+      if (!target) return notice(next ? '当前范围内没有可定位的下一步。' : '跳转目标不存在：' + value, true)
+      const row = tree.querySelector('[data-step-code="' + CSS.escape(target.stepCode) + '"]')
+      if (!row?.getClientRects().length) return notice('跳转目标已隐藏：' + target.stepName, true)
+      row.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+      row.getAnimations().filter(animation => animation.id === 'step-jump-highlight').forEach(animation => animation.cancel())
+      const color = getComputedStyle(row).getPropertyValue('--accent').trim()
+      row.animate([{ boxShadow: 'inset 0 0 0 2px ' + color }, { boxShadow: 'inset 0 0 0 2px transparent' }],
+        { id: 'step-jump-highlight', duration: 1600 })
+    }
+    links.append(link)
+  }
+  return links
+}
+function syncFailureJumpRequired(active) {
+  const target = $('flowControlFields').querySelector('[data-step-option=failedSkipTo]')
+  if (!target) return
+  target.required = active
+}
 function renderExecutionFields() {
-  const container=$('executionFields');container.replaceChildren()
-  const step=selectedStep();if(!step)return
-  let values;try{values=JSON.parse($('stepOptions').value)}catch(_){return}
-  const scope=window.stepStructure.scopes(current.dsl.steps).find(list=>list.some(item=>item.stepCode===step.stepCode))||[]
-  const jumps=scope.map(item=>[item.stepName,item.stepName])
-  const fields=[['status','使用状态',[[1,'启用'],[0,'禁用']]],['failedStrategy','执行失败策略',[[0,'终止'],[1,'忽略'],[2,'跳转']]],
-    ['skipTo','成功后跳转',jumps],['failedSkipTo','失败后跳转',jumps],['falseSkipTo','条件不成立跳转',jumps],['skipCondition','跳过此步骤条件'],
-    ['failedRetry','失败重试次数',null],['timeout','执行超时（秒）',null],['waitBefore','执行前等待（秒）',null],['waitAfter','执行后等待（秒）',null],['maxExecuteNum','最多执行次数',null]]
+  const flow = $('flowControlFields'), execution = $('executionFields')
+  flow.replaceChildren(); execution.replaceChildren()
+  const step = selectedStep(), values = readStepOptions()
+  syncStepDisabled(values)
+  if (!step || !values || $('stepParametersPanel').hidden) return
+  const jumps = [['NEXT','下一步'], ...stepJumpScope(step.stepCode).map(item=>[item.stepName,item.stepName])]
+  renderStepOptions(flow, values, [
+    ['skipTo','成功后跳转',jumps], ['failedSkipTo','失败/条件不成立跳转',jumps], ['skipCondition','跳过此步骤条件']
+  ])
+  renderStepOptions(execution, values, [
+    ['failedStrategy','执行失败策略',[[0,'终止'],[1,'忽略'],[2,'跳转']]],
+    ['failedRetry','失败重试次数',null], ['timeout','执行超时（秒）',null],
+    ['waitBefore','执行前等待（秒）',null], ['waitAfter','执行后等待（秒）',null], ['maxExecuteNum','最多执行次数',null]
+  ])
+  syncFailureJumpRequired(Number(values.failedStrategy)===2)
+}
+function renderStepOptions(container, values, fields) {
   for(const [key,title,options] of fields){
     const label=document.createElement('label');label.textContent=title
     const control=document.createElement(options?'select':'input');control.dataset.stepOption=key
-    if(options)control.replaceChildren(new Option('默认 / 不指定',''),...options.map(option=>new Option(option[1],String(option[0]))))
+    if(options){
+      const placeholder = key==='failedStrategy'?'默认（终止）':key==='failedSkipTo'?'请选择跳转目标':'默认 / 不指定'
+      control.replaceChildren(new Option(placeholder,''),...options.map(option=>new Option(option[1],String(option[0]))))
+      const currentValue = String(values[key]??'')
+      if (key==='failedSkipTo' && currentValue && !options.some(([value])=>value===currentValue)) {
+        control.add(new Option(currentValue+'（目标不存在）',currentValue))
+      }
+    }
     else if(options===null){control.type='number';control.min='0';control.step='1'}
     control.value=values[key]??'';control.disabled=stepEditingBlocked()
     control.addEventListener(options?'change':'input',()=>{
-      try{const next=JSON.parse($('stepOptions').value);if(control.value==='')delete next[key];else next[key]=options===null||['status','failedStrategy'].includes(key)?Number(control.value):control.value;$('stepOptions').value=pretty(next)}
+      try {
+        const next=JSON.parse($('stepOptions').value)
+        if(control.value==='')delete next[key]
+        else next[key]=options===null||key==='failedStrategy'?Number(control.value):control.value
+        $('stepOptions').value=pretty(next)
+        if(key==='failedStrategy')syncFailureJumpRequired(next.failedStrategy===2)
+      }
       catch(error){notice(error.message,true)}
     });label.append(control);container.append(label)
   }
@@ -266,20 +352,25 @@ async function loadActionSchemas() {
 }
 function renderWorkspace(preserveInputs = false) {
   if (!current) return
+  const tree = $('stepTree')
+  const treeScroll = tree.dataset.sessionId === current.id ? tree.scrollTop : 0
   renderRequestAttachments()
   $('revision').textContent = 'revision ' + current.revision + (current.readOnly ? ' · 只读' : '')
   $('agentState').textContent = current.state
+  renderAgentActivity(current)
   const approval = current.pendingApproval
   approvals = approval?.id || null; $('approval').hidden = !approval
   if (approval) $('approvalText').textContent = approval.tool + '\n' + pretty(approval.args) + (approval.execution ? '\n执行范围：\n' + pretty(approval.execution) : '')
   $('reconcileExecutor').hidden = productionRunningFor(current) || !(current.executionUncertain || current.executorBlocked)
   if (!preserveInputs) $('dsl').value = pretty(current.dsl)
-  $('stepTree').replaceChildren()
+  tree.replaceChildren()
   $('stepTree').classList.toggle('empty', !current.dsl.steps.length)
   if (!current.dsl.steps.length) {
     const add=document.createElement('button');add.textContent='＋ 添加第一个步骤';add.disabled=stepEditingBlocked();add.onclick=()=>$('addStep').click();$('stepTree').append(add)
   }
   const stepStates=window.stepState.classifySteps(current.dsl,current.savedBaseline),voidedBranches=[]
+  const scopesByCode = new Map(window.stepStructure.scopes(current.dsl.steps)
+    .flatMap(scope => scope.map(step => [step.stepCode, scope])))
   let visibleSteps=0
   visitSteps(current.dsl.steps, (step, location) => {
     const button = document.createElement('button')
@@ -293,18 +384,21 @@ function renderWorkspace(preserveInputs = false) {
     if(state.modified)labels.push(state.added?'新增':'未保存')
     if(state.voided)labels.push('禁用')
     const code = document.createElement('small'); code.textContent = step.actionCode
-    button.append(name, code)
+    button.append(name)
+    const metadata = document.createElement('span')
+    metadata.className = 'step-row-metadata'
+    metadata.append(code)
     if(labels.length){
       const badges=document.createElement('span');badges.className='step-state-tags'
       for(const text of labels){const badge=document.createElement('em');badge.textContent=text;badges.append(badge)}
-      button.append(badges);button.title+=' · '+labels.join(' · ');button.setAttribute('aria-label',button.title)
+      metadata.append(badges);button.title+=' · '+labels.join(' · ');button.setAttribute('aria-label',button.title)
     }
     button.onclick=()=>navigateStepRow(location).catch(error=>notice(error.message,true))
     button.ondblclick=()=>navigateStepRow(location,true).catch(error=>notice(error.message,true))
     const row=document.createElement('div');row.className='step-row'+(location.length>1?' child':'')
     row.classList.toggle('step-filtered-voided',filtered)
     row.classList.toggle('step-modified',state.modified);row.classList.toggle('step-voided',state.voided)
-    const handle=document.createElement('span');handle.className='step-drag-handle';handle.textContent='⠿';handle.title='拖动调整同层级步骤顺序';handle.setAttribute('aria-hidden','true')
+    const handle=document.createElement('span');handle.className='step-drag-handle';handle.textContent='⠿';handle.title='拖到行上方或下方可排序，拖到外层步骤中央可设为子步骤';handle.setAttribute('aria-hidden','true')
     const actions=document.createElement('div');actions.className='step-row-actions'
     const settings=document.createElement('button');settings.className='step-settings';settings.textContent='⚙';settings.title='设置步骤属性';settings.setAttribute('aria-label','设置 '+step.stepName+' 的属性')
     const add=document.createElement('button');add.className='step-add';add.textContent='＋';add.title='新增或粘贴步骤';add.setAttribute('aria-label','在 '+step.stepName+' 旁新增或粘贴步骤');add.disabled=stepEditingBlocked()
@@ -320,8 +414,11 @@ function renderWorkspace(preserveInputs = false) {
       const open=document.createElement('button');open.className='step-open-subflow';open.textContent='↗';open.title='打开子流程配置';open.setAttribute('aria-label','打开 '+(step.actionArgs?.flowName||step.stepName)+' 子流程配置')
       open.onclick=()=>openSubflowTab(step.stepCode).catch(error=>notice(error.message,true));actions.append(open)
     }
-    actions.append(settings,copy,remove);row.append(handle,button,actions);$('stepTree').append(row)
-    if(typeof attachStepDragging==='function')attachStepDragging(row,step)
+    const jumps = stepJumpLinks(step, scopesByCode.get(step.stepCode) || [], tree)
+    actions.append(settings,copy,remove);row.append(handle,button)
+    if (jumps.childElementCount) row.append(jumps)
+    row.append(metadata,actions);tree.append(row)
+    if(typeof attachStepDragging==='function')attachStepDragging(row,step,location)
   })
   if(stepStates.size&&!visibleSteps){const hint=document.createElement('p');hint.className='voided-steps-empty muted';hint.textContent='暂无启用步骤，取消勾选“隐藏禁用步骤”可查看。';$('stepTree').append(hint)}
   $('candidate').hidden = !current.proposal
@@ -333,7 +430,7 @@ function renderWorkspace(preserveInputs = false) {
     const line = document.createElement('div'); line.textContent = ({ pending: '○ ', in_progress: '◉ ', completed: '✓ ' })[item.status] + item.text
     $('plan').append(line)
   }
-  const blocked = current.readOnly || productionRunningFor(current) || ['running','waiting_approval','stopping'].includes(current.state)
+  const blocked = stepEditingBlocked()
   $('applyCandidate').disabled=blocked||!!current.proposal?.advisoryOnly
   $('referenceModeHint').hidden=!current.readOnly
   $('applyCandidate').title=current.readOnly||current.proposal?.advisoryOnly?'只读流程建议仅供审阅或临时调试，不能直接应用':''
@@ -343,7 +440,11 @@ function renderWorkspace(preserveInputs = false) {
   for(const control of document.querySelectorAll('[data-step-option],[data-argument]'))control.disabled=blocked
   $('task').disabled=taskLoading||!!taskLoadError||['running','waiting_approval','stopping'].includes(current.state)
   if (!preserveInputs) renderProperties()
+  else syncStepDisabled()
   if(typeof updateDesignHeader==='function')updateDesignHeader()
+  // Rebuilding the rows can reset the scroll position when the list is briefly empty.
+  tree.dataset.sessionId = current.id
+  tree.scrollTop = treeScroll
 }
 function stepIdentityRepairNotice(session) {
   if (!session || session.serverChanged) return ''
@@ -437,6 +538,7 @@ function showJson(title, value, save, help = '', { scrollList = false } = {}) {
   dialog.showModal()
 }
 function setView(view) {
+  if(view!=='executors'&&$('executorSettingsDialog')?.open)$('executorSettingsDialog').close()
   document.querySelectorAll('.view').forEach(item => { item.hidden = item.id !== view })
   const section = ['flowManagement','workspace','resources'].includes(view) ? 'applications' : view
   document.querySelectorAll('[data-view]').forEach(item => {item.classList.toggle('selected', item.dataset.view === section);item.setAttribute('aria-current',item.dataset.view===section?'page':'false')})
@@ -457,6 +559,57 @@ unsubscribe = window.desktop.on('agent:event', event => {
   refreshSnapshot().catch(error => notice(error.message, true))
 })
 const terminalAgentTurns=new Set(['turn/completed','turn/failed','turn/cancelled','turn/budget_exhausted','session/interrupted'])
+const visibleAgentProgressLimit = 3
+let agentActivityTimer
+function renderAgentActivity(session) {
+  const activity = $('agentActivity')
+  clearInterval(agentActivityTimer)
+  activity.hidden = !['running', 'waiting_approval', 'stopping'].includes(session?.state)
+  if (activity.hidden) return
+
+  const events = session.events.filter(event => event.turnId === session.turn?.id)
+  const lastExecution = events.findLast(event => event.type === 'execution/completed')
+  const phase = events.findLast(event => [
+    'turn/started', 'turn/interrupt_requested', 'approval/requested', 'approval/resolved',
+    'model/started', 'model/finished', 'model/superseded', 'item/started', 'item/completed',
+    'item/failed', 'execution/started', 'execution/result_received', 'execution/observed',
+    'execution/completed', 'message/assistant', 'engine/activity'
+  ].includes(event.type))
+  const afterExecution = lastExecution && phase?.sequence > lastExecution.sequence
+  const purpose = phase?.data.purpose
+  const tool = phase?.data.tool
+  const labels = {
+    'engine/activity': phase?.data.text,
+    'approval/resolved': '正在处理授权结果',
+    'model/started': phase?.data.finalization ? '正在生成本轮结论' : afterExecution ? '执行已结束，正在等待模型分析执行结果' : '正在等待模型响应',
+    'model/finished': '已收到模型回复，正在处理',
+    'model/superseded': '已收到补充指令，正在更新分析',
+    'item/started': tool === 'propose_dsl_patch' ? '正在校验并准备候选补丁' : purpose || '正在调用工具 ' + (tool || ''),
+    'item/completed': '正在处理工具结果',
+    'item/failed': '正在处理工具错误',
+    'execution/started': '正在等待执行器返回执行结果',
+    'execution/result_received': '已收到执行结果，正在保存执行证据',
+    'execution/observed': '已采集执行证据，正在整理执行明细',
+    'execution/completed': session.turn?.mode === 'develop' ? '正在整理执行结果，准备后续分析' : '正在整理执行明细',
+    'message/assistant': '正在处理模型回复'
+  }
+  let label = labels[phase?.type] || '正在准备本轮请求'
+  if (afterExecution && ['item/started', 'item/completed', 'item/failed'].includes(phase.type)) label = '执行后分析 · ' + label
+  if (session.state === 'waiting_approval') label = '等待你确认执行授权'
+  if (session.state === 'stopping') {
+    const stop = events.findLast(event => event.type === 'turn/interrupt_requested')
+    label = stop?.data.executionPending ? '正在等待执行器停止' : '正在停止本轮 Agent'
+  }
+  if ($('agentPhase').textContent !== label) $('agentPhase').textContent = label
+  $('stopAgentActivity').disabled = session.state === 'stopping'
+  const started = Date.parse(phase?.at || session.turn?.startedAt) || Date.now()
+  const updateElapsed = () => {
+    const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000))
+    $('agentElapsed').textContent = seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
+  }
+  updateElapsed()
+  agentActivityTimer = setInterval(updateElapsed, 1000)
+}
 function hasAgentResult(turnId) {
   return turnId && [...$('timeline').querySelectorAll('[data-agent-result]')].some(item=>item.dataset.agentResult===turnId)
 }
@@ -493,12 +646,20 @@ function restoreAgentTimeline(session) {
 }
 function renderAgentTimelineEvent(event,restoring=false) {
   const progress=(content,kind)=>{
-    if(hasAgentResult(event.turnId))return
+    if(!content||hasAgentResult(event.turnId))return
+    const visible=$('timeline').querySelectorAll('[data-agent-progress]')
+    for(let index=0;index<=visible.length-visibleAgentProgressLimit;index++)visible[index].remove()
     const item=appendMessage(content,kind)
-    if(item&&event.turnId)item.dataset.agentProgress=event.turnId
+    item.dataset.agentProgress=event.turnId||''
   }
   if (event.type === 'message/assistant') {
-    if(event.data.finalization)appendMessage(event.data.content)
+    if(event.data.finalization){
+      const result = event.data.debugConclusion && [...$('timeline').querySelectorAll('[data-agent-result]')]
+        .findLast(item => item.dataset.agentResult === event.turnId)
+      if(result)result.firstChild.textContent=event.data.content
+      else appendMessage(event.data.content)
+      if(event.data.warning)appendMessage(event.data.warning,'error')
+    }
     else progress(event.data.content,'assistant')
   }
   else if (event.type === 'approval/requested') {
@@ -519,6 +680,7 @@ function renderAgentTimelineEvent(event,restoring=false) {
   else if (terminalAgentTurns.has(event.type)) {
     clearAgentProgress(event.turnId)
     if(event.type==='turn/failed')appendMessage(event.data.error||'本轮执行失败。','error')
+    if(event.type==='turn/budget_exhausted')appendMessage(event.data.error||event.data.message||'本轮任务预算已用完，已保存进度。','error')
     if(event.type==='turn/cancelled'||event.type==='session/interrupted')appendMessage('本轮已停止。')
     $('timeline').scrollTop=$('timeline').scrollHeight
   }
@@ -553,8 +715,18 @@ action('generateFlow', async () => {
   }, '请使用业务字典中的实际编码。先检查模型配置，再创建流程。生成失败时保留已创建流程，可打开后继续生成。')
 })
 $('task').onchange = async () => {
-  try { current = await invoke('workspace:update', requireCurrent(), { taskCode: $('task').value }); notice('调试账户已绑定当前会话') }
-  catch (error) { notice(error.message, true); $('task').value = current?.taskCode || '' }
+  const id = requireCurrent()
+  pendingAccountSelections.add(id)
+  updateDesignHeader()
+  try {
+    const next = await invoke('workspace:update', id, { taskCode: $('task').value })
+    if (current?.id === id) { current = next; notice('调试账户已绑定当前会话') }
+  } catch (error) {
+    if (current?.id === id) { notice(error.message, true); $('task').value = current.taskCode || '' }
+  } finally {
+    pendingAccountSelections.delete(id)
+    if (current?.id === id) updateDesignHeader()
+  }
 }
 action('showDsl', async () => {
   const id=requireCurrent(),button=$('showDsl');button.disabled=true;button.textContent='加载 DSL…'
@@ -581,7 +753,16 @@ async function commitSelectedStep() {
   if (!selectedStep()) throw new Error('请选择步骤')
   const dsl = structuredClone(current.dsl)
   const step = atPath(dsl, selected)
-  const options = JSON.parse($('stepOptions').value)
+  const options = readStepOptions()
+  if (!options) throw new Error('步骤选项 JSON 必须为有效对象')
+  if (!options.failedSkipTo && options.falseSkipTo) options.failedSkipTo = options.falseSkipTo
+  delete options.falseSkipTo
+  if (Number(options.failedStrategy) === 2) {
+    if (!options.failedSkipTo) throw new Error('执行失败策略为「跳转」时，请选择失败后跳转目标')
+    if (options.failedSkipTo !== 'NEXT' && !stepJumpScope(step.stepCode).some(item=>item.stepName===options.failedSkipTo)) {
+      throw new Error('失败后跳转目标不存在，请重新选择')
+    }
+  }
   const children = { ...(step.body ? { body: step.body } : {}), ...(step.children ? { children: step.children } : {}) }
   const next = { ...options, stepCode: step.stepCode, stepName: $('stepName').value, actionCode: $('actionCode').value,
     actionArgs: JSON.parse($('actionArgs').value), targetArgs: JSON.parse($('targetArgs').value), ...children }
@@ -763,7 +944,7 @@ $('request').addEventListener('paste',event=>{
   }).catch(error=>{if(current?.id===id&&input.value===original){input.setRangeText(text,start,end,'end');updateComposerMode();notice(error.message,true)}})
 })
 const defaultAgentPrompts = {
-  develop: '请运行当前流程的完整 DSL 并采集执行证据，定位首个有证据支持的异常。若确认存在流程配置问题，请生成候选修复补丁供我审核。',
+  develop: '请运行一次当前完整 DSL，简述执行结果。若流程失败或中断，请说明发生在哪一步以及原因。若证据支持修改步骤，请生成候选修复补丁供我审核。',
   dslRun: '请运行当前流程的完整 DSL（包括引用的子流程），采集并保留执行日志、现场上下文、页面 DOM 和截图。仅返回执行结果和证据，不做诊断、不生成补丁。'
 }
 function confirmDefaultAgentPrompt(mode, request) {
@@ -796,26 +977,30 @@ async function sendComposerRequest(id) {
     throw new Error('请描述需要配置的步骤，再发送需求')
   }
   const runOnly = mode === 'dslRun'
-  if (runOnly && (taskLoading || !current.taskCode)) throw new Error('请先选择申报账户，再运行当前 DSL')
-  if (!runOnly && !$('composerModel').value) throw new Error('请先在系统设置中配置 AI 模型')
+  const taskCode = current.taskCode
+  const problem = mode === 'generate' ? '' : accountSelectionProblem()
+  if (problem) throw new Error(problem)
+  if (!runOnly && !usingCodexEngine() && !$('composerModel').value) throw new Error('请先在系统设置中配置 AI 模型')
   let request = rawRequest
   if (!preview.text.trim()) {
     const defaultRequest = defaultAgentPrompts[mode]
-    const taskCode = current.taskCode, revision = current.revision
-    const target = runOnly ? '\n\n流程：'+$('workspaceFlowName').textContent+'\n申报账户：'+($('task').selectedOptions[0]?.value === taskCode ? $('task').selectedOptions[0].textContent : taskCode) : ''
+    const revision = current.revision
+    const target = mode !== 'generate' ? '\n\n流程：'+$('workspaceFlowName').textContent+'\n申报账户：'+$('task').selectedOptions[0]?.textContent : ''
     if (!await confirmDefaultAgentPrompt(mode, defaultRequest + target)) return
-    if (current?.id !== id || current.taskCode !== taskCode || current.revision !== revision) throw new Error('流程或申报账户已变化，请重新发送')
+    if (current?.id !== id || current.taskCode !== taskCode || current.revision !== revision ||
+        (mode !== 'generate' && accountSelectionProblem())) throw new Error('流程或申报账户已变化，请重新发送')
     request = runOnly ? defaultRequest : [defaultRequest, rawRequest].filter(Boolean).join('\n\n')
   }
   if (runOnly) {
     appendMessage(request, 'user')
-    await executeAndShowEvidence(id, { mode, request })
+    await executeAndShowEvidence(id, { mode, request, taskCode })
     if (current?.id === id && $('request').value.trim() === rawRequest) $('request').value = ''
     return
   }
   appendMessage((preview.text||defaultAgentPrompts[mode])+(files.length?'\n附件：'+files.map(file=>file.name).join('、'):'')+(preview.parts.length?'\nHTML源码将自动转换为附件。':''), 'user'); $('request').value = ''
   attachmentDrafts.delete(id);renderRequestAttachments()
-  try { await invoke('agent:start', id, { request, attachmentIds:files.map(file=>file.artifactId), mode,modelName:$('composerModel').value,writeToEditor:false }) }
+  try { await invoke('agent:start', id, { request, taskCode, attachmentIds:files.map(file=>file.artifactId), mode,
+    engine:$('composerEngine').value,modelName:$('composerModel').value,writeToEditor:false }) }
   catch(error){
     const merged=new Map([...files,...(attachmentDrafts.get(id)||[])].map(file=>[file.artifactId,file]))
     if(current?.id===id){
@@ -866,13 +1051,102 @@ async function executeAndShowEvidence(id, input) {
   }
 }
 action('runCurrent', () => direct('run_current_dsl'))
+action('runWithCapturePoints', async () => {
+  const id = requireCurrent()
+  if (inputDirty()) throw new Error('请先更新当前步骤输入，避免执行旧配置')
+  const revision = current.revision, taskCode = current.taskCode
+  const { dsl } = await invoke('workspace:dsl', id)
+  if (current?.id !== id || current.revision !== revision || current.taskCode !== taskCode) throw new Error('调试账户或流程已变化，请重新选择采证点')
+  const choices = []
+  for (const flow of [dsl, ...(dsl.subflows || [])]) {
+    const addSteps = (steps, prefix) => {
+      for (const step of steps) {
+        if (step.status === 0) continue
+        const name = prefix + ' / ' + (step.stepName || step.stepCode)
+        choices.push({ flowCode: flow.flowCode, stepCode: step.stepCode, name })
+        addSteps(step.body || step.children || [], name)
+      }
+    }
+    addSteps(flow.steps, flow.flowName || flow.flowCode)
+  }
+  if (!choices.length) throw new Error('没有启用的采证步骤')
+  const dialog = document.createElement('dialog')
+  dialog.className = 'capture-points-dialog'
+  const form = document.createElement('form')
+  const title = document.createElement('h2')
+  title.textContent = '指定采证点运行'
+  dialog.setAttribute('aria-label', title.textContent)
+  const rows = document.createElement('div')
+  const toolbar = document.createElement('div')
+  toolbar.className = 'row'
+  const error = document.createElement('p')
+  error.setAttribute('role', 'alert')
+  const button = (label, callback, parent = toolbar) => {
+    const control = document.createElement('button')
+    control.type = 'button'; control.textContent = label; control.onclick = callback
+    parent.append(control)
+    return control
+  }
+  const entries = []
+  const add = button('添加采证点', () => addRow())
+  button('取消', () => dialog.close())
+  const submit = button('运行当前 DSL')
+  submit.type = 'submit'
+  function addRow() {
+    const row = document.createElement('div')
+    row.className = 'row capture-point-row'
+    const step = document.createElement('select'), timing = document.createElement('select')
+    step.setAttribute('aria-label', '采证步骤')
+    step.append(...choices.map(({ name }, index) => new Option(name, index)))
+    timing.setAttribute('aria-label', '采证时机')
+    timing.append(new Option('执行后', 'AFTER'), new Option('执行前', 'BEFORE'))
+    const evidence = {}
+    const entry = { step, timing, evidence }
+    row.append(step, timing)
+    for (const [key, label] of [['dom', 'DOM'], ['ctx', 'CTX'], ['screenshot', '截图']]) {
+      const field = document.createElement('label'), check = document.createElement('input')
+      check.type = 'checkbox'; check.checked = true
+      evidence[key] = check
+      field.append(check, label); row.append(field)
+    }
+    button('移除', () => {
+      entries.splice(entries.indexOf(entry), 1); row.remove()
+      add.disabled = false; submit.disabled = !entries.length
+    }, row)
+    entries.push(entry); rows.append(row)
+    add.disabled = entries.length >= 8; submit.disabled = false
+  }
+  form.onsubmit = event => {
+    event.preventDefault()
+    if (current?.id !== id || current.revision !== revision || current.taskCode !== taskCode) {
+      error.textContent = '调试账户或流程已变化，请重新选择采证点。'; return
+    }
+    const capturePoints = entries.map(({ step, timing, evidence }) => {
+      const { flowCode, stepCode } = choices[Number(step.value)]
+      return { flowCode, stepCode, timing: timing.value, dom: evidence.dom.checked, ctx: evidence.ctx.checked, screenshot: evidence.screenshot.checked }
+    })
+    if (capturePoints.some(point => !point.dom && !point.ctx && !point.screenshot)) {
+      error.textContent = '每个采证点至少选择一种证据。'; return
+    }
+    if (new Set(capturePoints.map(point => JSON.stringify([point.flowCode, point.stepCode, point.timing]))).size !== capturePoints.length) {
+      error.textContent = '同一步骤和时机只需添加一次。'; return
+    }
+    dialog.close()
+    direct('run_current_dsl', { capturePoints }).catch(failure => notice(failure.message, true))
+  }
+  dialog.onclose = () => dialog.remove()
+  form.append(title, rows, error, toolbar); dialog.append(form); document.body.append(dialog)
+  addRow()
+  dialog.showModal()
+})
 action('runStep', () => {
   const step = selectedStep(); if (!step) throw new Error('请选择步骤')
   return direct('run_selected_step', { stepCode: step.stepCode })
 })
 action('runCandidate', () => direct('run_proposed_dsl'))
 action('continueRun', () => direct('continue_failed_run'))
-action('stopAgent', async () => { await invoke('agent:stop', requireCurrent()); notice('已请求停止，等待执行器确认；执行锁会保留到请求结束。') })
+action('stopAgent', () => invoke('agent:stop', requireCurrent()))
+$('stopAgentActivity').onclick = () => $('stopAgent').click()
 for (const [id, allowed] of [['approve', true], ['reject', false]]) action(id, async () => {
   if (!approvals) throw new Error('执行授权已失效')
   await invoke('agent:approve', requireCurrent(), approvals, allowed); approvals = null; $('approval').hidden = true
@@ -914,6 +1188,7 @@ async function loadSettings() {
   $('modelApiKey').placeholder = value.hasModelApiKey ? '密钥已保存，留空保留' : 'API Key'
   $('localDebugToken').placeholder = value.hasLocalDebugToken ? '令牌已保存，留空保留' : '执行器调试令牌'
   $('remoteEnabled').checked = value.remoteEnabled; connections = value.connections; renderConnections()
+  for(const id of ['startExecutor','stopExecutor','logs'])$(id).hidden=value.remoteEnabled
 }
 action('addConnection', async () => { connections.push({ baseUrl: '', debugToken: '' }); renderConnections() })
 action('saveSettings', async () => {
@@ -932,6 +1207,8 @@ action('saveExecutorSettings', async () => {
       remoteEnabled: $('remoteEnabled').checked, connections })
     clearWorkspace(); await bootstrap(); await loadSettings(); await refreshExecutorCards()
     $('executorSaveMessage').textContent = '执行器配置已保存，请重新打开流程。'
+    $('executorSettingsDialog').close()
+    notice('执行器配置已保存，请重新打开流程。')
   } catch (error) {
     $('executorSaveMessage').textContent = '保存失败：' + error.message
     throw error
@@ -939,6 +1216,7 @@ action('saveExecutorSettings', async () => {
 })
 for (const [id, operation] of [['startExecutor', 'start'], ['stopExecutor', 'stop'], ['switchExecutor', 'switch']]) action(id, async () => {
   const result = await invoke('executor:control', operation, $('platform').value); notice(result.text)
+  await refreshExecutorCards()
 })
 action('logs', () => invoke('executor:logs'))
 

@@ -11,7 +11,7 @@ test('viewed DSL is identical to the IDE builder for root metadata, nested steps
     runSupport:'browser',sessionKeep:'1',serverId:100}
   const rows=[row('页面','page',{status:1,failedRetry:1,failedStrategy:0,waitBefore:0,waitAfter:2,timeout:30,
     actionArgs:'{"url":"https://example.test"}',actionArgsVOS:[{fieldKey:'url',fieldValue:'https://example.test',isHideCust:false}]}),
-    row('判断','match',{falseSkipTo:'代码块',list:[row('点击','click',{targetArgs:'{"xpath":"//button"}'})]}),
+    row('判断','match',{failedSkipTo:'代码块',list:[row('点击','click',{targetArgs:'{"xpath":"//button"}'})]}),
     row('代码块','codeBlock',{list:[row('块内输入','input',{actionArgs:{value:'demo'}})]}),
     row('调用登录','subFlow',{actionArgs:{flowName:'登录'}})]
   const flows=[{flowCode:'main',flowName:'主流程'},{flowCode:'login',flowName:'登录'},{flowCode:'leaf',flowName:'刷新'}]

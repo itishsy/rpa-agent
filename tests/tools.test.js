@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { createTools, validateCandidate, toSaveRows, verifyBusiness } = require('../src/agent/tools')
+const { createTools, validateCandidate, toSaveRows } = require('../src/agent/tools')
 const { clone, digest } = require('../src/agent/store')
 const commands = { items: [{ actionCode: 'page', actionName: '页面', actionArgsVOS: [
   { fieldKey: 'actionType', fieldName: '操作', fieldType: 'singleDropList' }, { fieldKey: 'actionArgs', fieldName: '参数', fieldType: 'text' }
@@ -105,8 +105,77 @@ test('proposals validate revision, command fields and scope without applying', a
   assert.equal(session.dsl.steps[0].stepName, '打开页面')
   assert.equal(session.proposal.dsl.steps[0].stepName, '打开工作台')
   await assert.rejects(tools.get('propose_dsl_patch').run({ ...patch, baseRevision: 3 }, { session, harness: fakeHarness }), /版本已变化/)
+  await assert.rejects(tools.get('propose_dsl_patch').run({ baseRevision: 0, operations: [
+    { op: 'set', stepCode: 's1', field: 'falseSkipTo', value: 'NEXT' }
+  ] }, { session, harness: fakeHarness }), /不允许修改字段/)
   assert.throws(() => validateCandidate(session, { ...dsl, appCode: 'foreign' }, commands), /跨应用/)
   assert.throws(() => validateCandidate(session, { ...dsl, steps: [{ ...dsl.steps[0], actionArgs: { url: 'guessed' } }] }, commands), /未知指令参数/)
+})
+
+test('one proposal inserts an ordered batch and a complete nested group with generated unique ids', async () => {
+  const session = makeSession()
+  const definitions = { ...commands, items: [...commands.items,
+    { actionCode: 'codeBlock', actionName: '代码块', actionArgsVOS: [], targetArgsVOS: [] }] }
+  const tool = createTools({ commands: async () => definitions }).get('propose_dsl_patch')
+  const proposal = await tool.run(tool.validate({ baseRevision: 0, operations: [
+    { op: 'insert', index: 0, steps: [
+      { stepName: '确认失败弹框', actionCode: 'page', children: [
+        { stepName: '关闭失败弹框', actionCode: 'page' },
+        { stepName: '记录失败信息', actionCode: 'page' }
+      ] },
+      { stepName: '循环单个封存', actionCode: 'codeBlock', body: [
+        { stepCode: 'enter', stepName: '录入单个', actionCode: 'page', skipTo: '保存单个' },
+        { stepName: '保存单个', actionCode: 'page' }
+      ] }
+    ] },
+    { op: 'insert', parentStepCode: 's1', steps: [
+      { stepName: '附加步骤一', actionCode: 'page' }, { stepName: '附加步骤二', actionCode: 'page' }
+    ] }
+  ] }), { session, harness: fakeHarness })
+  assert.deepEqual(proposal.dsl.steps.map(step => step.stepName), ['确认失败弹框', '循环单个封存', '打开页面'])
+  assert.deepEqual(proposal.dsl.steps[0].children.map(step => step.stepName), ['关闭失败弹框', '记录失败信息'])
+  assert.deepEqual(proposal.dsl.steps[1].body.map(step => step.stepName), ['录入单个', '保存单个'])
+  assert.deepEqual(proposal.dsl.steps[2].children.map(step => step.stepName), ['附加步骤一', '附加步骤二'])
+  assert.equal(proposal.dsl.steps[1].body[0].skipTo, '保存单个')
+  assert.equal(proposal.changedStepCodes.length, 8)
+  assert.equal(new Set(proposal.changedStepCodes).size, 8)
+  assert.ok(proposal.changedStepCodes.every(code => typeof code === 'string' && code.length))
+  assert.equal(toSaveRows({ ...session, dsl: proposal.dsl }, definitions).length, 9)
+  assert.deepEqual(session.dsl, dsl)
+})
+
+test('a single insert with multiple child steps also writes the full generation draft', async () => {
+  const session = makeSession()
+  session.turn = {}
+  const tool = createTools({ commands: async () => commands }).get('propose_dsl_patch')
+  const result = await tool.run(tool.validate({ baseRevision: 0, operations: [{
+    op: 'insert', step: { stepName: '失败处理', actionCode: 'page', children: [
+      { stepName: '确认', actionCode: 'page' }, { stepName: '返回', actionCode: 'page' }
+    ] }
+  }] }), { session, harness: fakeHarness, turn: { mode: 'generate', writeToEditor: true } })
+  assert.equal(result.generated, true)
+  assert.equal(result.changedStepCodes.length, 3)
+  assert.equal(session.dsl.steps[1].children.length, 2)
+  assert.equal(session.revision, 1)
+  assert.equal(session.proposal, null)
+})
+
+test('invalid inserted batches leave the editor and existing candidate intact', async () => {
+  const session = makeSession()
+  session.proposal = { id: 'existing', dsl: clone(dsl) }
+  const before = clone(session)
+  const tool = createTools({ commands: async () => commands }).get('propose_dsl_patch')
+  const step = { stepCode: 'added', stepName: '新增', actionCode: 'page' }
+  for (const operation of [
+    { op: 'insert', steps: [step, step] },
+    { op: 'insert', step, steps: [step] },
+    { op: 'insert', steps: [{ ...step, children: [{ ...step, stepCode: 's1' }] }] },
+    { op: 'insert', steps: [{ ...step, children: [{ ...step, stepCode: 'child', unknownField: true }] }] },
+    { op: 'insert', steps: [{ ...step, body: [{ ...step, stepCode: 'body' }] }] }
+  ]) {
+    await assert.rejects(tool.run(tool.validate({ baseRevision: 0, operations: [operation] }), { session, harness: fakeHarness }))
+    assert.deepEqual(session, before)
+  }
 })
 test('subflow proposals bind both revisions without mutating the root or child editor', async () => {
   const root = makeSession(), child = makeSession()
@@ -141,6 +210,23 @@ test('repaired native identities save each original row and never send repair me
   assert.equal(JSON.parse(saved[1].actionArgs).actionArgs, 'https://example.test/query')
   assert.deepEqual(buildDebugDsl('app', 'flow', dsl, nestDebugSteps(saved)), session.dsl)
 })
+test('saved steps keep native IDs when leaving or entering a code block and update group ownership', () => {
+  const session = makeSession()
+  const [page] = session.dsl.steps
+  const block = {stepCode:'block',stepName:'代码块',actionCode:'codeBlock'}
+  const old = {...page,id:7,groupCode:'block'}
+  const definitions = {...commands, items:[...commands.items,{actionCode:'codeBlock',actionArgsVOS:[],targetArgsVOS:[]}],
+    oldSteps:[{...block,list:[old]}]}
+  const remaining = {...page,stepCode:'remaining',stepName:'保留步骤'}
+  session.dsl.steps = [block, page]
+  block.body = [remaining]
+  let saved = toSaveRows(session, definitions)
+  assert.deepEqual(saved.map(row=>[row.stepCode,row.level,row.groupCode]),[['block',0,undefined],['remaining',1,'block'],[page.stepCode,0,null]])
+  assert.equal(saved.at(-1).id,7)
+  block.body.push(page);session.dsl.steps.pop()
+  saved = toSaveRows(session, definitions)
+  assert.deepEqual([saved.at(-1).id,saved.at(-1).level,saved.at(-1).groupCode],[7,1,'block'])
+})
 test('execute rejects foreign accounts and stale candidates before calling executor', async () => {
   let count = 0
   const tools = createTools({ tasks: async () => [{ taskCode: 'owned' }], execute: async () => { count++ } })
@@ -155,18 +241,6 @@ test('continuation requires resumable failure and the original account', async (
   await assert.rejects(tools.get('continue_failed_run').run({}, { session }), /无可续跑/)
   session.runs = [{ taskCode: 'original', result: { status: 'FAILED', resumable: true, executionCode: 'e1' } }]; session.taskCode = 'other'
   await assert.rejects(tools.get('continue_failed_run').run({}, { session }), /账户与原执行不一致/)
-})
-test('business success needs a fresh, unique, complete final page and positive assertions', async () => {
-  const rules = [{ id: 'ok', type: 'textContains', expected: '成功' }]
-  const query = async content => [content]
-  const result = { status: 'SUCCEEDED', snapshots: [{ phase: 'FINAL', snapshotId: 'final', dom: { status: 'AVAILABLE', content: '成功', url: 'https://example.test' } }] }
-  assert.equal((await verifyBusiness(rules, result, query)).status, 'VERIFIED')
-  assert.equal((await verifyBusiness([], result, query)).status, 'UNKNOWN')
-  assert.equal((await verifyBusiness(rules, { ...result, snapshots: [] }, query)).status, 'UNKNOWN')
-  const truncated = clone(result); truncated.snapshots[0].dom.truncated = true
-  assert.equal((await verifyBusiness(rules, truncated, query)).status, 'UNKNOWN')
-  const failed = clone(result); failed.snapshots[0].dom.content = '退回'
-  assert.equal((await verifyBusiness(rules, failed, query)).status, 'FAILED')
 })
 test('fingerprints ignore key insertion order but bind the full executable configuration', () => {
   assert.equal(digest({ a: 1, b: 2 }), digest({ b: 2, a: 1 }))

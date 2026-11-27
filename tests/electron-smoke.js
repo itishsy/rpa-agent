@@ -1,7 +1,7 @@
 'use strict'
 // Real Electron + preload + encrypted persistence + local mock platform/executor.
 // Never connects to declaration websites or starts/stops an installed robot.
-const { app, BrowserWindow, safeStorage, dialog } = require('electron')
+const { app, BrowserWindow, safeStorage, dialog, nativeImage } = require('electron')
 app.disableHardwareAcceleration()
 const fs = require('node:fs')
 const path = require('node:path')
@@ -30,8 +30,8 @@ let invalidLeafJump=false
 let emptyBlockTest=false,emptyBlockRows=[{stepCode:'login-block',stepName:'账号密码登录',actionCode:'codeBlock',level:0,number:0,list:[]}]
 const publicTemplates = [{ flowCode: 'template-child', flowName: '医疗增员单个',readOnly:true },
   { flowCode: 'template-leaf', flowName: '模板末级' }, { flowCode: 'template-body', flowName: '来源模板' }]
-let requests = [], cancelled = false, modelCalls = 0, lastDebugDsl, steeredResponse
-let holdDebug = false, releaseDebug
+let requests = [], cancelled = false, modelCalls = 0, lastDebugDsl, lastCapturePoints, steeredResponse, analysisResponse
+let holdDebug = false, releaseDebug, accountAvailable = true
 let budgetSamples = 0, closingSamples = 0
 let duplicateIdentityTest = false
 const server = http.createServer((req, res) => {
@@ -57,7 +57,8 @@ const server = http.createServer((req, res) => {
       }
       if(lastUser==='[execute-without-confirmation]'){
         const done=JSON.parse(body).messages.some(message=>message.role==='tool'&&message.tool_call_id==='auto-execution')
-        const message=done?{role:'assistant',content:'执行完成'}:{role:'assistant',content:'正在读取现场。',tool_calls:[{id:'auto-execution',type:'function',function:{name:'run_current_dsl',arguments:'{}'}}]}
+        if(done){analysisResponse=res;return}
+        const message={role:'assistant',content:'正在读取现场。',tool_calls:[{id:'auto-execution',type:'function',function:{name:'run_current_dsl',arguments:'{}'}}]}
         res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{message}]}));return
       }
       if (lastUser === '[truncated-integration]') {
@@ -79,16 +80,19 @@ const server = http.createServer((req, res) => {
     else if (url.pathname.endsWith('/oauth/check_token')) data = { active: true, exp: Date.now() / 1000 + 3600 }
     else if (url.pathname.endsWith('/sys/user/menu/listMenuByUser/1')) data = { menus:[],tabs:[],buttons:[] }
     else if (url.pathname.endsWith('/robot/app/getAppData') || url.pathname.endsWith('/robot/app/page')) data = { rows: [{ appCode: 'app', appName: '离线示例', appArgs: '{}' }], total: 1 }
-    else if (url.pathname.endsWith('/robot/flow/list')) data = [{ flowCode: 'flow', flowName: '示例流程', appCode: 'app' }, { flowCode: 'child', flowName: '子流程', appCode: 'app',templateFlowCode:'unused-template' },
-      { flowCode: 'template-alias', flowName: '引用模板', appCode: 'app', templateFlowCode: 'template-body' },...publicTemplates.map(flow=>({...flow,appCode:'app'})),
+    else if (url.pathname.endsWith('/robot/flow/list')) data = JSON.parse(body).appCode === 'reference-app'
+      ? publicTemplates.filter(flow => flow.flowCode !== 'template-body').map(flow => ({...flow,appCode:'reference-app'}))
+      : [{ flowCode: 'flow', flowName: '示例流程', appCode: 'app' }, { flowCode: 'child', flowName: '子流程', appCode: 'app',templateFlowCode:'unused-template' },
+      { flowCode: 'template-alias', flowName: '引用模板', appCode: 'app', relationFlowCode: 'template-body' },
+      ...publicTemplates.filter(flow => flow.flowCode === 'template-leaf').map(flow => ({...flow,appCode:'app'})),
       ...(emptyBlockTest?[{flowCode:'empty-block',flowName:'登录',appCode:'app',templateFlowCode:'stale-template'}]:[]),
       ...(duplicateIdentityTest ? [{ flowCode: 'duplicate-flow', flowName: '重复编码场景', appCode: 'app' }] : [])]
     else if (url.pathname.endsWith('/robot/flow/listTemplate')) {
       assert.equal(url.searchParams.get('flowType'), '2'); assert.equal(url.searchParams.get('templateType'), '1'); data = publicTemplates
     }
-    else if (url.pathname.endsWith('/robot/client/app/getByFlowCode/template-body')) data = publicTemplates.find(flow => flow.flowCode === 'template-body')
+    else if (url.pathname.endsWith('/robot/client/app/getByFlowCode/template-body')) data = { flowCode: 'template-body', appCode: 'reference-app', flowName: '来源流程' }
     else if (url.pathname.endsWith('/robot/flow/step/list/template-alias')) {
-      data = [{ stepCode: 'alias-call', stepName: '调用模板单个', actionCode: 'subFlow', level: 0, actionArgs: '{"flowName":"医疗增员单个"}' }]
+      data = []
     }
     else if (url.pathname.endsWith('/robot/flow/step/list/template-body')) data=[{stepCode:'alias-call',stepName:'调用模板单个',actionCode:'subFlow',level:0,actionArgs:'{"flowName":"医疗增员单个"}'}]
     else if (url.pathname.endsWith('/robot/flow/step/list/template-child')) data = [{ stepCode: 'template-page', stepName: '模板页面', actionCode: 'page', level: 0,
@@ -107,17 +111,34 @@ const server = http.createServer((req, res) => {
       : url.searchParams.get('dataCode') === 'subFlow' ? [{ fieldKey: 'flowName', fieldName: '流程', fieldType: 'text' }] : fields
     else if (url.pathname.endsWith('/robot/action/target/args')) data = []
     else if (url.pathname.endsWith('/api/robot/task/listAllTask')) {
-      assert.equal(req.method, 'POST'); data = [{ taskCode: 'task', taskName: '测试账户' }]
+      assert.equal(req.method, 'POST'); data = accountAvailable ? [{ taskCode: 'task', taskName: '测试账户' }] : []
     } else if (url.pathname.endsWith('/api/robot/debug/runs/active/cancel')) { cancelled = true; data = { cancelled: true } }
     else if (url.pathname.endsWith('/api/robot/debug/runs')) {
       assert.equal(req.headers['x-rpa-debug-token'], 'smoke-debug')
-      lastDebugDsl = JSON.parse(body).dsl
+      const debugRequest = JSON.parse(body)
+      lastDebugDsl = debugRequest.dsl
+      lastCapturePoints = debugRequest.capture?.points
       data = { status: 'SUCCEEDED', executionCode: 'run-1', snapshots: [{ phase: 'FINAL', snapshotId: 'final-1', dom: { status: 'AVAILABLE', content: `<html><body>业务成功<span id="account">unit1</span><span id="period">2026-11</span><span id="count">2</span><span id="amount">100.00</span><span id="officialState">已入账</span><table><tr><td class="person">p1</td><td class="state">已入账</td></tr><tr><td class="person">p2</td><td class="state">已入账</td></tr></table></body></html>`, url: 'https://example.test' } }] }
       data.trace = [{ stepName: '判断页面', status: 'BRANCH', message: '条件成立' },
+        { stepName: '关闭窗口1', status: 'FAILED', failedStrategy: 1, message: 'ignored-window-exception-stack' },
         { stepName: '被跳过的页面', status: 'SKIPPED' }, { stepName: '访问页面', status: 'SUCCEEDED' }]
       data.startedAt = '2026-11-12T01:02:03.000Z'
       data.snapshots[0].ctx = { variables: [{ name: 'status', type: 'String', value: 'fixture-context' }] }
       data.snapshots[0].screenshots = { items: [{ contentType: 'image/png', base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jcZkAAAAASUVORK5CYII=' }] }
+      if (debugRequest.capture?.points?.length) {
+        const point = debugRequest.capture.points[0]
+        data.snapshots.unshift({ ...data.snapshots[0], snapshotId: 'point-1', phase: 'POINT',
+          flowCode: point.flowCode, stepCode: point.stepCode, timing: point.timing })
+      }
+      if (debugRequest.capture?.recording?.enabled) {
+        const jpeg = nativeImage.createFromPath(path.join(__dirname, '../src/assets/app.png')).resize({ width: 64 }).toJPEG(75)
+        const bytes = Buffer.concat([jpeg, jpeg])
+        data.recording = { status: 'AVAILABLE', contentType: 'video/x-msvideo', fps: 2, durationMs: 1000,
+          stopReason: 'DURATION_LIMIT', base64: bytes.toString('base64'), frames: [
+            { offset: 0, length: jpeg.length, elapsedMs: 0, stepCode: 'first-step', flowCode: 'flow' },
+            { offset: jpeg.length, length: jpeg.length, elapsedMs: 500, stepCode: 'last-step', flowCode: 'flow' }
+          ] }
+      }
       if (holdDebug) {
         holdDebug = false
         await new Promise(resolve => { releaseDebug = resolve })
@@ -153,9 +174,26 @@ app.on('browser-window-created', (_event, win) => {
         await desktop.invoke('platform:select', saved.platforms[0].id);
         await desktop.invoke('settings:save', {modelBaseUrl:${JSON.stringify(endpoint + '/v1')},modelName:'mock-model',modelApiKey:'mock-model-key',localDebugToken:'',remoteEnabled:true,connections:[{baseUrl:${JSON.stringify(endpoint)},debugToken:'smoke-debug'},{baseUrl:${JSON.stringify(secondEndpoint)},debugToken:'smoke-debug'}]});
         await bootstrap(); await loadApplications(); document.getElementById('application').value='app'; await loadFlows(); document.getElementById('flow').value='flow'; await openFlow();
-        current = await desktop.invoke('workspace:update', current.id, {taskCode:'task'});
         return true;
       })()`)
+      await wait('!taskLoading&&$("task").options.length===2')
+      const callsBeforeAccount = modelCalls
+      for (const mode of ['dslRun', 'develop']) {
+        await run(`$("mode").value=${JSON.stringify(mode)};updateComposerMode()`)
+        assert.equal(await run('$("send").disabled'), true)
+        await assert.rejects(run(`desktop.invoke("agent:start",current.id,{mode:${JSON.stringify(mode)},request:"调试"})`), /请先选择申报账户/)
+      }
+      await run('$("mode").value="generate";updateComposerMode()')
+      assert.equal(await run('$("send").disabled'), false)
+      assert.equal(modelCalls, callsBeforeAccount)
+      await run('$("task").value="task";$("task").dispatchEvent(new Event("change"))')
+      await wait('current.taskCode==="task"&&!pendingAccountSelections.has(current.id)')
+      accountAvailable = false
+      try {
+        await assert.rejects(run('desktop.invoke("agent:start",current.id,{mode:"develop",request:"调试"})'), /申报账户在当前执行器上已失效/)
+        assert.equal(modelCalls, callsBeforeAccount)
+        assert.equal(await run('current.turn == null'), true)
+      } finally { accountAvailable = true }
       assert.equal(await run('document.querySelectorAll(".step-item").length'), 1)
       await run(`(async()=>{ document.getElementById('stepName').value='修改后的页面'; await commitSelectedStep(); })()`)
       await new Promise(resolve => setTimeout(resolve, 300))
@@ -176,42 +214,96 @@ app.on('browser-window-created', (_event, win) => {
       await run('$("confirmDefaultAgentPrompt").click()')
       await wait('$("executionEvidenceDialog")?.open&&!$("send").disabled')
       assert.equal(await run('current.turn.mode'), 'dslRun')
-      assert.equal(await run('current.runs[0].verification.reason'), '仅运行模式未进行业务核验')
+      assert.equal(await run('"verification" in current.runs[0]'), false)
       assert.equal(await run('!!current.proposal'), false)
       assert.doesNotMatch(await run('$("executionEvidenceSummary").textContent'), /业务核验/)
       assert.equal(modelCalls,callsBeforeRun)
       assert.equal(requests.filter(item=>item.path==='/api/robot/debug/runs').length,runsBeforeRun+1)
       await run('$("executionEvidenceDialog").close();$("mode").value="generate";updateComposerMode()')
-      await run('direct("run_current_dsl")')
-      assert.equal(await run('current.runs[0].verification.status'), 'UNKNOWN')
+      await run('$("agentSessionMenuTrigger").click();$("runWithCapturePoints").click()')
+      await wait('document.querySelector(".capture-points-dialog")?.open')
+      const selectedPoint = await run('current.dsl.steps[0].stepCode')
+      await run(`(() => {
+        const dialog = document.querySelector('.capture-points-dialog')
+        const addPoint = [...dialog.querySelectorAll('button')].find(button => button.textContent === '添加采证点')
+        dialog.querySelectorAll('.capture-point-row select')[1].value = 'BEFORE'
+        addPoint.click()
+        dialog.querySelector('button[type=submit]').click()
+      })()`)
+      await wait('$("executionEvidenceDialog")?.open&&!$("send").disabled')
+      assert.deepEqual(lastCapturePoints.map(point => [point.stepCode, point.timing]), [[selectedPoint, 'BEFORE'], [selectedPoint, 'AFTER']])
+      assert.equal(await run('"verification" in current.runs[0]'), false)
       assert.equal(await run('$("executionEvidenceDialog")?.open'), true)
       assert.match(await run('$("executionEvidenceSummary").textContent'), /当前完整 DSL/)
       assert.match(await run('$("executionEvidenceRun").textContent'), /run-1.*2026.*09:02:03/)
-      assert.match(await run('$("executionEvidenceSummary").textContent'), /调试成功.*业务核验：未确认/)
+      assert.match(await run('$("executionEvidenceSummary").textContent'), /调试成功/)
+      assert.doesNotMatch(await run('$("executionEvidenceSummary").textContent'), /业务核验/)
       assert.match(await run('$("executionEvidencePanel").textContent'), /判断页面.*分支跳转.*访问页面.*成功/)
       assert.doesNotMatch(await run('$("executionEvidencePanel").textContent'), /被跳过的页面/)
+      assert.match(await run('$("executionEvidencePanel").textContent'), /关闭窗口1.*忽略/)
+      assert.doesNotMatch(await run('$("executionEvidencePanel").textContent'), /ignored-window-exception-stack/)
+      assert.match(await run('$("executionEvidenceSummary").textContent'), /失败 0 次，忽略 1 次/)
       await run('$("evidence-tab-ctx").click()')
       assert.match(await run('$("executionEvidencePanel").textContent'), /fixture-context/)
+      assert.match(await run('$("executionEvidencePanel").querySelector("select").textContent'), /指定采证 · 执行前/)
       await run('$("evidence-tab-dom").click()')
       assert.match(await run('$("executionEvidencePanel pre")?.textContent || $("executionEvidencePanel").textContent'), /<html>.*业务成功/)
       await run('$("evidence-tab-screenshots").click()')
       assert.match(await run('$("executionEvidencePanel").querySelector("img").src'), /^data:image\/png;base64,/)
       await run('$("executionEvidenceDialog").close()')
+      await run('$("mode").value="dslRun";updateComposerMode();$("request").value="启动录屏运行";$("send").click()')
+      await wait('$("executionEvidenceDialog")?.open&&!$("send").disabled')
+      assert.equal(await run('current.turn.recording.enabled'), true)
+      await run('$("evidence-tab-recording").click()')
+      await wait('$("executionEvidencePanel").querySelector("img")?.naturalWidth>0')
+      assert.match(await run('$("executionEvidencePanel").textContent'), /first-step.*已达到录制时长上限/)
+      assert.match(await run('$("executionEvidencePanel").querySelector("a").download'), /\.avi$/)
+      await run('$("executionEvidencePanel").querySelector("button").click()')
+      await wait('$("executionEvidencePanel").textContent.includes("last-step")')
+      await run('(()=>{const seek=$("executionEvidencePanel").querySelector("input");seek.value="0";seek.dispatchEvent(new Event("input"))})()')
+      assert.match(await run('$("executionEvidencePanel").textContent'), /first-step/)
+      await run('$("executionEvidenceDialog").close();$("mode").value="generate";updateComposerMode()')
       const beforeAuto=requests.filter(item=>item.path==='/api/robot/debug/runs').length
-      await run('desktop.invoke("agent:start",current.id,{request:"[execute-without-confirmation]",mode:"develop"})')
+      await run('window.analysisRun = desktop.invoke("agent:start",current.id,{request:"[execute-without-confirmation]",mode:"develop"}); void 0')
+      await wait('!$("agentActivity").hidden && $("agentPhase").textContent.includes("等待模型分析执行结果")')
+      for (let tries = 0; tries < 30 && !analysisResponse; tries++) await new Promise(resolve => setTimeout(resolve, 50))
+      assert.ok(analysisResponse)
+      assert.equal(await run('$("stopAgentActivity").disabled'),false)
+      assert.match(await run('$("agentElapsed").textContent'), /秒/)
+      assert.ok(await run('$("timeline").querySelector("[data-agent-result]")'))
+      assert.equal(await run('$("timeline").querySelectorAll("[data-agent-progress]").length'),0)
+      analysisResponse.setHeader('Content-Type','application/json')
+      analysisResponse.end(JSON.stringify({choices:[{message:{role:'assistant',content:'执行完成'}}]}))
+      await run('window.analysisRun')
+      await wait('$("agentActivity").hidden && current.state === "completed"')
       assert.equal(requests.filter(item=>item.path==='/api/robot/debug/runs').length,beforeAuto+1)
       assert.equal(await run('current.pendingApproval==null&&$("approval").hidden'),true)
       await run('[...$("timeline").querySelectorAll("button[data-debug-artifact]")].at(-1).click()')
       await wait('$("executionEvidenceDialog")?.open')
       await run('$("executionEvidenceDialog").close()')
-      await wait('$("timeline").textContent.includes("执行完成")')
-      assert.doesNotMatch(await run('$("timeline").textContent'),/调用工具：|正在读取现场/)
+      assert.match(await run('[...$("timeline").querySelectorAll("[data-agent-result]")].at(-1).textContent'), /调试成功.*查看本次执行明细/)
+      assert.doesNotMatch(await run('$("timeline").textContent'),/调用工具：|正在读取现场|执行完成/)
       assert.equal(await run('$("plan").childElementCount'),0)
       await run('refreshSnapshot()')
       await run('$("timeline").replaceChildren();restoreAgentTimeline(current)')
-      assert.match(await run('$("timeline").textContent'),/执行完成/)
-      assert.doesNotMatch(await run('$("timeline").textContent'),/调用工具：|正在读取现场/)
+      assert.match(await run('[...$("timeline").querySelectorAll("[data-agent-result]")].at(-1).textContent'), /调试成功.*查看本次执行明细/)
+      assert.doesNotMatch(await run('$("timeline").textContent'),/调用工具：|正在读取现场|执行完成/)
       assert.ok(await run('$("timeline").querySelector("button[data-debug-artifact]")'))
+      const recentProgress = await run(`(() => {
+        const timeline = $("timeline"), resultCount = timeline.querySelectorAll("[data-agent-result]").length
+        const event = (type,data) => ({type,data,turnId:"progress-limit-test"})
+        renderAgentTimelineEvent(event("input/queued",{content:"保留用户消息"}))
+        for (let index=1;index<=5;index++) {
+          renderAgentTimelineEvent(event("item/started",{tool:"tool_"+index,purpose:"进度 "+index}))
+        }
+        const rows = [...timeline.querySelectorAll("[data-agent-progress]")].map(row=>row.textContent)
+        renderAgentTimelineEvent(event("turn/completed",{}))
+        return {rows, cleared:!timeline.querySelector("[data-agent-progress]"),
+          resultKept:timeline.querySelectorAll("[data-agent-result]").length===resultCount,
+          inputKept:timeline.textContent.includes("保留用户消息")}
+      })()`)
+      assert.deepEqual(recentProgress,{rows:['调用工具：tool_3，进度 3','调用工具：tool_4，进度 4','调用工具：tool_5，进度 5'],
+        cleared:true,resultKept:true,inputKept:true})
       await run('desktop.invoke("agent:start", current.id, {request:"生成修复候选",mode:"generate"})')
       assert.match(await run('$("timeline").textContent'),/候选已生成/)
       assert.doesNotMatch(await run('$("timeline").textContent'),/调用工具：get_flow_context/)
@@ -240,10 +332,10 @@ app.on('browser-window-created', (_event, win) => {
       const sessionId = await run('current.id')
       const beforeRestore = await run('current.savedBaseline')
       await run(`(async()=>installWorkspace(await desktop.invoke('workspace:attach',${JSON.stringify(sessionId)})))()`)
-      assert.equal(await run('current.runs.length'), 3)
+      assert.equal(await run('current.runs.length'), 4)
       if (await run('!!current.serverChanged')) console.error('Baseline before/after', JSON.stringify(beforeRestore), JSON.stringify(await run('current.savedBaseline')))
       assert.equal(await run('!!current.serverChanged'), false)
-      assert.equal(await run('current.runs[0].verification.status'), 'UNKNOWN')
+      assert.equal(await run('"verification" in current.runs[0]'), false)
       const encryptedSettings = fs.readFileSync(path.join(process.env.RPA_AGENT_TEST_DATA, 'settings.enc'), 'utf8')
       assert.ok(!encryptedSettings.includes('smoke-debug'))
       const config = await run('desktop.invoke("mcp:control", current.id, true)')
@@ -431,7 +523,12 @@ app.on('browser-window-created', (_event, win) => {
       const templateOpened=await run('desktop.invoke("workspace:open",{appCode:"app",flowCode:"template-alias",executor:current.scope.executor})')
       assert.equal(templateOpened.session.dsl.steps.length,1)
       assert.equal(templateOpened.session.dsl.steps[0].actionArgs.flowName,'医疗增员单个')
-      assert.ok(!requests.some(request=>/listTemplate|getByFlowCode|templateFlowCode|templateType/.test(request.path)))
+      assert.equal(templateOpened.session.readOnly,true)
+      const referenceDsl = await run(`desktop.invoke("workspace:dsl",${JSON.stringify(templateOpened.session.id)})`)
+      assert.deepEqual(referenceDsl.diagnostics, [])
+      assert.deepEqual(referenceDsl.dsl.subflows.map(flow => flow.flowCode), ['template-child', 'template-leaf'])
+      assert.ok(requests.some(request=>request.path.endsWith('/getByFlowCode/template-body')))
+      assert.ok(!requests.some(request=>/listTemplate|templateFlowCode|templateType/.test(request.path)))
       await run('(async()=>{const opened=await desktop.invoke("workspace:open",{appCode:"app",flowCode:"flow",executor:current.scope.executor});installWorkspace(opened);setView("workspace");await showDebugExecutionDetails(current.id,null,"dsl")})()')
       assert.equal(await run('current.runs.length'), 0)
       assert.ok(await run('$("executionEvidenceRun").options.length >= 2'))

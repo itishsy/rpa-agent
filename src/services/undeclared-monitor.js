@@ -1,6 +1,7 @@
 const http = require('http')
 const https = require('https')
 const { createHash } = require('crypto')
+const { isProxyPath } = require('./proxy-auth')
 
 // 主进程内存缓存，页面切换与定时刷新均可复用；不落盘保存 token。
 const tokenCache = new Map()
@@ -120,6 +121,18 @@ async function fetchPayFeeList(server) {
 }
 
 async function authenticatedRequest(server, endpoint, body = {}, options = {}) {
+  if (isProxyPath(server.baseServer)) {
+    try {
+      return await requestJson(buildApiUrl(server.baseServer, endpoint), {
+        ...options,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify(body)
+      })
+    } catch (error) {
+      if (isAuthFailure(error)) throw new Error('代理服务登录态无效，请先登录代理服务后重试')
+      throw error
+    }
+  }
   if (server.accessToken) {
     return requestJson(buildApiUrl(server.baseServer, endpoint), {
       ...options,
@@ -130,6 +143,23 @@ async function authenticatedRequest(server, endpoint, body = {}, options = {}) {
       body: JSON.stringify(body)
     })
   }
+  const username = toText(server.username)
+  const password = toText(server.password)
+  if (!username && !password) {
+    try {
+      return await requestJson(buildApiUrl(server.baseServer, endpoint), {
+        ...options,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify(body)
+      })
+    } catch (error) {
+      if (error.statusCode === 401 || error.statusCode === 403 || ['401', '403'].includes(String(error.businessCode))) {
+        throw new Error('代理服务登录态无效，请先登录代理服务或配置登录账户和密码')
+      }
+      throw error
+    }
+  }
+  if (!username || !password) throw new Error('登录账户和密码须同时配置')
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const { key, entry } = cachedLogin(server)
     const accessToken = await entry.promise
@@ -507,7 +537,14 @@ async function platformPaymentServers(platformService) {
 module.exports = {
   TAKEOVER_COMMENT, takeoverBlockReason, takeoverSource, readTakeoverAccount, pauseTakeoverAccount, updateTakeoverAccount,
   analysisSourceKey,
-  analysisAccessToken: async server => server.accessToken || await cachedLogin(server).entry.promise,
+  analysisAccessToken: async server => {
+    if (isProxyPath(server.baseServer)) return ''
+    if (server.accessToken) return server.accessToken
+    const username = toText(server.username), password = toText(server.password)
+    if (!username && !password) return ''
+    if (!username || !password) throw new Error('登录账户和密码须同时配置')
+    return cachedLogin(server).entry.promise
+  },
   authenticatedRequest,
   platformPaymentServers,
   previousOperateMonth,

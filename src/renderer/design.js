@@ -2,18 +2,31 @@
 let workspaceOpening=false,taskLoading=false,taskLoadSequence=0,taskLoadError=''
 const pendingProductionRuns = new Set()
 const productionRunningFor = session => !!session && (pendingProductionRuns.has(session.id) || session.productionRunning)
-function selectPropertyTab(policy=false){
-  for(const [tab,panel,active] of [['stepParametersTab','stepParametersPanel',!policy],['stepPolicyTab','stepPolicyPanel',policy]]){
+const stepRefresh = document.createElement('button')
+stepRefresh.id = 'stepRefresh'
+stepRefresh.type = 'button'
+stepRefresh.textContent = '刷新'
+stepRefresh.title = '重新加载当前流程与申报账户'
+const propertyTabs = [
+  ['stepParametersTab', 'stepParametersPanel'],
+  ['stepJsonTab', 'stepJsonPanel']
+]
+function selectPropertyTab(selectedTab = 'stepParametersTab'){
+  for(const [tab,panel] of propertyTabs){
+    const active = tab === selectedTab
     $(tab).setAttribute('aria-selected',String(active));$(tab).tabIndex=active?0:-1;$(panel).hidden=!active
   }
-  if(policy)renderExecutionFields()
+  renderExecutionFields()
 }
-for(const [id,policy] of [['stepParametersTab',false],['stepPolicyTab',true]]){
-  $(id).onclick=()=>selectPropertyTab(policy)
+for(const [index,[id]] of propertyTabs.entries()){
+  $(id).onclick=()=>selectPropertyTab(id)
   $(id).onkeydown=event=>{
     if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return
-    event.preventDefault();const next=event.key==='Home'?false:event.key==='End'?true:!policy
-    selectPropertyTab(next);$(next?'stepPolicyTab':'stepParametersTab').focus()
+    event.preventDefault()
+    const last=propertyTabs.length-1
+    const next=event.key==='Home'?0:event.key==='End'?last:(index+(event.key==='ArrowLeft'?last:1))%propertyTabs.length
+    const [nextId]=propertyTabs[next]
+    selectPropertyTab(nextId);$(nextId).focus()
   }
 }
 $('actionCode').addEventListener('change',()=>loadActionSchemas().catch(error=>{$('actionSchema').textContent=error.message}))
@@ -24,18 +37,16 @@ async function chooseDesignExecutor(data,application){
   if(saved&&executors.includes(saved)){
     $('executor').value=saved;document.title=(application.appName||application.appCode)+'（连接至 '+saved.replace(/^https?:\/\//,'')+'）';return
   }
-  selectOptions($('designConnectExecutor'),executors,item=>item,item=>data.executorNames?.[item]?data.executorNames[item]+' · '+item:item,'请选择执行器')
-  for(const address of Object.keys(data.executorNames||{})){
-    invoke('executor:service-name',address).then(name=>{
-      if(!name)return
-      for(const id of ['designConnectExecutor','executor','stepExecutor']){
-        const option=[...$(id).options].find(item=>item.value===address)
-        if(option)option.textContent=name+' · '+address
-      }
-    }).catch(()=>{})
-  }
-  $('confirmDesignConnect').disabled=!executors.length
-  $('designConnectError').textContent=executors.length?'':'尚未配置执行器，请在左侧执行器管理中添加连接后重新打开。'
+  const picker=$('designConnectExecutor')
+  const serviceFeedback=document.createElement('p')
+  serviceFeedback.id='designConnectServiceFeedback';serviceFeedback.className='muted';serviceFeedback.hidden=true
+  serviceFeedback.setAttribute('role','status')
+  picker.closest('label').after(serviceFeedback)
+  picker.setAttribute('aria-describedby',serviceFeedback.id)
+  selectOptions(picker,executors,item=>item,item=>data.executorNames?.[item]?data.executorNames[item]+' · '+item:item,'请选择执行器')
+  picker.disabled=true
+  $('confirmDesignConnect').disabled=true
+  $('designConnectError').textContent=executors.length?'正在读取后台服务名称…':'尚未配置执行器，请在左侧执行器管理中添加连接后重新打开。'
   $('designFlowTab').textContent='RPA流程管理（'+(application.appName||application.appCode)+'）'
   const connected=new Promise(resolve=>{
     $('designConnectForm').onsubmit=async event=>{
@@ -51,7 +62,38 @@ async function chooseDesignExecutor(data,application){
   })
   $('cancelDesignConnect').onclick=()=>window.close()
   $('designConnectDialog').oncancel=event=>{event.preventDefault();if(!$('cancelDesignConnect').disabled)window.close()}
-  $('designConnectDialog').showModal();await invoke('design:ready');await connected
+  $('designConnectDialog').showModal()
+  await invoke('design:ready')
+  if(executors.length){
+    const results=await Promise.allSettled(executors.map(address=>invoke('executor:service-name',address)))
+    const unavailable=new Map()
+    results.forEach((result,index)=>{
+      const address=executors[index]
+      if(result.status==='rejected'){
+        unavailable.set(address,'读取失败，请重新打开选择窗口。')
+        return
+      }
+      const {name,reason}=result.value
+      if(reason)unavailable.set(address,reason)
+      if(!name)return
+      for(const select of [picker,$('executor'),$('stepExecutor')]){
+        const option=[...select.options].find(item=>item.value===address)
+        if(option)option.textContent=name+' · '+address
+      }
+    })
+    const updateServiceFeedback=()=>{
+      const reason=picker.value?unavailable.get(picker.value):unavailable.size&&`${unavailable.size} 个执行器未能读取实时后台服务名称。选择执行器可查看原因。`
+      serviceFeedback.hidden=!reason
+      serviceFeedback.textContent=reason||''
+    }
+    picker.onchange=updateServiceFeedback
+    updateServiceFeedback()
+    picker.disabled=false
+    $('confirmDesignConnect').disabled=false
+    $('designConnectError').textContent=''
+    if(document.activeElement===$('cancelDesignConnect'))picker.focus()
+  }
+  await connected
 }
 $('taskSelectorHost').append($('task'))
 const voidedStepsToggle=document.createElement('label');voidedStepsToggle.className='voided-steps-toggle'
@@ -65,9 +107,13 @@ syncProductionButton.type='button';syncProductionButton.id='syncProduction';sync
 $('flowManagement').querySelector('.flow-filters').append($('organizeFlows'),$('newFlow'),syncProductionButton)
 action('syncProduction',openProductionSync)
 const executorStatusSection=document.createElement('section');executorStatusSection.className='saved-executor-status'
+$('executorCards').classList.add('executor-grid')
 const executorStatusHeading=document.createElement('div');executorStatusHeading.className='panel-heading'
 const executorStatusTitle=document.createElement('h2');executorStatusTitle.textContent='已保存连接状态'
-executorStatusHeading.append(executorStatusTitle,$('refreshExecutors'));executorStatusSection.append(executorStatusHeading,$('executorSummary'),$('executorCards'),$('executorEmpty'))
+const executorStatusActions=document.createElement('div');executorStatusActions.className='row'
+const configureExecutors=document.createElement('button');configureExecutors.id='configureExecutors';configureExecutors.textContent='连接配置';configureExecutors.onclick=openExecutorSettings
+executorStatusActions.append($('refreshExecutors'),configureExecutors)
+executorStatusHeading.append(executorStatusTitle,executorStatusActions);executorStatusSection.append(executorStatusHeading,$('executorSummary'),$('executorCards'),$('executorEmpty'))
 $('executorStatusHost').append(executorStatusSection)
 $('executorSettings').prepend($('executorPlatformControls'))
 function updateDesignHeader() {
@@ -79,31 +125,44 @@ function updateDesignHeader() {
   renderStepView()
   const nativeBusy=productionRunningFor(current)
   const busy=workspaceOpening||nativeBusy||['running','waiting_approval','stopping'].includes(current.state)
-  $('stepExecutor').disabled=busy;$('retryTasks').disabled=busy||taskLoading;$('stepRun').disabled=busy||taskLoading||!!taskLoadError;$('stepSave').disabled=busy||current.readOnly||savingFlow
+  $('stepExecutor').disabled=busy;$('retryTasks').disabled=busy||taskLoading;$('stepRun').disabled=busy||!!accountSelectionProblem();$('stepSave').disabled=busy||current.readOnly||savingFlow
   $('retryWorkspaceAccounts').disabled=busy||taskLoading
-  for(const id of ['runCurrent','runStep','runCandidate'])$(id).disabled=busy||taskLoading||!!taskLoadError
+  stepRefresh.disabled=busy||savingFlow||taskLoading||pendingAccountSelections.has(current.id)
+  for(const id of ['runCurrent','runWithCapturePoints','runStep','runCandidate'])$(id).disabled=busy||!!accountSelectionProblem()
   $('stepRun').textContent=nativeBusy?'运行中…':'运行'
   viewExecutionDetails.disabled = !!nativeBusy || !(current.productionRun || current.runs.some(run => run.evidenceState !== 'deleted'))
   viewExecutionDetails.title = nativeBusy ? '运行结束后查看执行明细' : '查看当前流程最近一次执行的明细'
-  $('task').disabled=busy||taskLoading||!!taskLoadError||!!current.takeoverTaskCode
+  $('task').disabled=busy||taskLoading||pendingAccountSelections.has(current.id)||!!taskLoadError||!!current.takeoverTaskCode
   for(const id of ['send','steer','continueRun','stopAgent'])$(id).disabled=!!nativeBusy
+  $('continueRun').disabled=busy||!!accountSelectionProblem()
   const rootId = workspaceRootId(current.id)
   const root = rootId === current.id ? current : workspaceTabs.get(rootId)?.data.session
   $('closeDesignStepTab').disabled = !!productionRunningFor(root)
   updateComposerMode()
 }
 const pendingComposerSends = new Set()
+const pendingAccountSelections = new Set()
+function accountSelectionProblem() {
+  if (taskLoading || pendingAccountSelections.has(current?.id)) return '正在核对申报账户，请稍候'
+  if (taskLoadError) return '申报账户加载失败，请重新读取'
+  if (!current?.taskCode || $('task').value !== current.taskCode) return '请先在顶部选择申报账户'
+  return ''
+}
 function updateComposerMode(){
   const nativeBusy=productionRunningFor(current)
   const agentBusy=['running','waiting_approval','stopping'].includes(current?.state)
   const mode=$('mode').value
   const debugging=mode==='develop',runOnly=mode==='dslRun'
-  $('send').disabled=pendingComposerSends.has(current?.id)||nativeBusy||agentBusy||!!attachmentUploads.get(current?.id)?.size
+  const accountProblem = debugging || runOnly ? accountSelectionProblem() : ''
+  $('send').disabled=workspaceOpening||pendingComposerSends.has(current?.id)||nativeBusy||agentBusy||!!accountProblem||!!attachmentUploads.get(current?.id)?.size
+  $('send').title=accountProblem || '发送'
   $('mode').disabled=nativeBusy||agentBusy
+  $('composerEngine').disabled=nativeBusy||agentBusy||runOnly
+  $('steer').disabled=!!nativeBusy||current?.turn?.engine==='codex-cli'&&agentBusy
   $('composerModel').disabled=nativeBusy||agentBusy||runOnly||!$('composerModel').value
   $('request').disabled=nativeBusy
   $('attachFile').disabled=nativeBusy||runOnly
-  $('request').placeholder=runOnly?'可填写运行备注，留空时可确认默认提示词…':debugging?'描述要排查或修复的问题，留空时可确认默认提示词…':'请描述需要配置的步骤…'
+  $('request').placeholder=accountProblem || (runOnly?'可填写运行备注，留空时可确认默认提示词…':debugging?'描述要排查或修复的问题，留空时可确认默认提示词…':'请描述需要配置的步骤…')
   $('mode').title=runOnly?'运行当前 DSL 并采集执行证据':debugging?'运行并诊断，修复建议以候选补丁呈现':'根据需求生成候选步骤'
 }
 $('mode').addEventListener('change',updateComposerMode)
@@ -148,9 +207,13 @@ async function showStepProperties(location,preserveTab=false,confirmed=false) {
     if(!target)throw new Error('步骤已变化，请重新选择')
     if(!preserveTab)selectPropertyTab()
     selectWorkspaceStep(target)
-    $('stepPropertiesDialog').querySelectorAll('.argument-json').forEach(details=>{details.open=false})
     $('stepPropertiesMessage').textContent=''
-    if(!$('stepPropertiesDialog').open)$('stepPropertiesDialog').showModal()
+    const dialog = $('stepPropertiesDialog')
+    if(!dialog.open){
+      dialog.showModal()
+      $('stepName').focus({preventScroll:true})
+    }
+    dialog.querySelectorAll('.step-settings-scroll').forEach(panel=>{panel.scrollTop=0})
     $('stepTree').querySelector('[data-step-code="'+CSS.escape(code)+'"]')?.scrollIntoView({block:'nearest',inline:'nearest'})
   }finally{propertyNavigationPending=false;updatePropertyNavigation()}
 }
@@ -193,7 +256,8 @@ async function runProductionFlow(){
   const id=current.id
   try{
     if(inputDirty()||JSON.stringify(current.dsl)!==JSON.stringify(current.savedBaseline))throw new Error('请先保存步骤配置，再运行服务器流程')
-    if(!current.taskCode)throw new Error('请先选择申报账户')
+    const problem = accountSelectionProblem()
+    if(problem)throw new Error(problem)
     pendingProductionRuns.add(id);renderWorkspace(true)
     await invoke('agent:start',id,{mode:'run'})
     if(current?.id===id && document.body.dataset.currentView==='workspace')await showExecutionDetails()
@@ -201,6 +265,34 @@ async function runProductionFlow(){
   finally{pendingProductionRuns.delete(id);if(current?.id===id){await refreshSnapshot().catch(error=>notice(error.message,true));renderWorkspace(true)}}
 }
 $('stepRun').onclick=runProductionFlow
+stepRefresh.onclick=async()=>{
+  if(!current||stepRefresh.disabled)return
+  const id=current.id, selectedCode=selectedStep()?.stepCode, uncommitted=inputDirty()
+  workspaceOpening=true
+  stepRefresh.textContent='刷新中…'
+  renderWorkspace(true)
+  try {
+    const next=await invoke('workspace:reload',id,uncommitted)
+    if(!next||current?.id!==id)return
+    snapshotRequest++
+    current=next
+    const tab=workspaceTabs.get(id)
+    if(tab)tab.data.session=next
+    renderWorkspaceTabs()
+    selected=null
+    if(selectedCode)visitSteps(next.dsl.steps,(step,location)=>{if(step.stepCode===selectedCode)selected=location})
+    if(!selected&&next.dsl.steps.length)selected=[0]
+    renderWorkspace()
+    await refreshWorkspaceTasks()
+    if(current?.id===id&&!taskLoadError)notice(stepIdentityRepairNotice(current)||'流程和申报账户已刷新。')
+  } catch(error) {
+    notice(String(error.message).replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/,''),true)
+  } finally {
+    workspaceOpening=false
+    stepRefresh.textContent='刷新'
+    if(current)renderWorkspace(true)
+  }
+}
 $('toggleAgent').onclick=()=>{
   const hidden=$('workspace').classList.toggle('agent-hidden');$('toggleAgent').setAttribute('aria-expanded',String(!hidden))
 }
@@ -458,7 +550,7 @@ async function switchWorkspaceTab(id){
     if(view){
       selected=structuredClone(view.selected);renderWorkspace()
       for(const [key,value] of Object.entries(view.values))$(key).value=value
-      loadActionSchemas().catch(error=>notice(error.message,true));if(!$('stepPolicyPanel').hidden)renderExecutionFields()
+      loadActionSchemas().catch(error=>notice(error.message,true));renderExecutionFields()
       $('stepTree').scrollTop=view.treeScroll;$('timeline').replaceChildren(...view.timeline.map(node=>node.cloneNode(true)));$('timeline').scrollTop=view.timelineScroll
       for (const event of current.events) {
         if (event.sequence > view.seenSequence) renderAgentTimelineEvent(event)

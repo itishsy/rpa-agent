@@ -2,6 +2,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { NtExecutable, NtExecutableResource, Data, Resource } = require('resedit')
+const { finalizePackage } = require('./finalize-windows-launcher')
 
 // Embed branding locally so packaging does not require downloading rcedit.
 module.exports = async function afterPack(context) {
@@ -38,4 +39,5 @@ module.exports = async function afterPack(context) {
     if (!actual || !Buffer.from(actual.bin).equals(entry.bin)) throw new Error('Packaging changed a non-brand resource')
   }
   fs.writeFileSync(target, result)
+  finalizePackage(context.appOutDir, process.env, { createShortcut: false })
 }

@@ -1,6 +1,7 @@
 'use strict'
 const fs = require('node:fs')
 const path = require('node:path')
+const { atomicWriteFileSync } = require('./atomic-file')
 const { digest, redact } = require('../agent-core/store')
 
 const LIMIT = 5
@@ -33,8 +34,7 @@ class ExecutionEvidence {
   read(file) { return JSON.parse(this.codec.decrypt(fs.readFileSync(file, 'utf8'))) }
   write(file, value) {
     fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file + '.tmp', this.codec.encrypt(JSON.stringify(value)), { mode: 0o600 })
-    fs.renameSync(file + '.tmp', file)
+    atomicWriteFileSync(file, this.codec.encrypt(JSON.stringify(value)))
   }
   payload(folder, id) {
     if (!/^[a-f\d-]{36}$/.test(id)) throw new Error('执行证据编号无效')
@@ -43,7 +43,7 @@ class ExecutionEvidence {
   metadata(run, scope) {
     return {
       id: run.artifactId, executionCode: run.result?.executionCode, at: run.result?.startedAt || run.at, recordedAt: run.at,
-      taskCode: run.taskCode, executor: scope.executor, conclusion: run.conclusion, verification: run.verification,
+      taskCode: run.taskCode, executor: scope.executor, conclusion: run.conclusion,
       executionScope: run.executionScope, revision: run.revision
     }
   }
